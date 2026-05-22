@@ -56,6 +56,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from kermt.data import MolCollator
 from kermt.data import StandardScaler
+from kermt.util.loss import MTLLoss
 from kermt.util.metrics import get_metric_func
 from kermt.util.nn_utils import initialize_weights, param_count_trainable, param_count_total
 from kermt.util.scheduler import NoamLR
@@ -66,7 +67,7 @@ from task.predict import predict, evaluate, evaluate_predictions
 
 
 
-def train(epoch, model, data, loss_func, optimizer, scheduler,
+def train(epoch, model, data, loss_func, mtl_loss, optimizer, scheduler,
           shared_dict, args: Namespace, n_iter: int = 0,
           logger: logging.Logger = None):
     """
@@ -113,7 +114,15 @@ def train(epoch, model, data, loss_func, optimizer, scheduler,
         model.zero_grad()
         preds = model(batch, features_batch)
         loss = loss_func(preds, targets) * class_weights * mask
-        loss = loss.sum() / mask.sum()
+
+        if mtl_loss is not None:
+            # Compute per-task mean losses, handling division by zero for tasks with no valid samples
+            task_mask_sum = mask.sum(axis=0)
+            task_mask_sum = torch.clamp(task_mask_sum, min=1.0)  # Avoid division by zero
+            task_losses = loss.sum(axis=0) / task_mask_sum
+            loss = mtl_loss(task_losses)
+        else:
+            loss = loss.sum() / mask.sum()
 
         loss_sum += loss.item()
         iter_count += args.batch_size
@@ -197,15 +206,24 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
         # Get loss and metric functions
         loss_func = get_loss_func(args, model)
 
-        optimizer = build_optimizer(model, args)
-        
+        if args.use_mtl_loss:
+            mtl_loss = MTLLoss(args.num_tasks)
+        else:
+            mtl_loss = None
+
         debug(model)
         debug(f'Number of trainable parameters = {param_count_trainable(model):,}')
         debug(f'Number of total parameters = {param_count_total(model):,}')
         if args.cuda:
             debug('Moving model to cuda')
             model = model.cuda()
-        
+            if mtl_loss is not None:
+                mtl_loss = mtl_loss.cuda()
+        optimizer = build_optimizer(model, args)
+        if args.use_mtl_loss:
+            # Train log_sigma with same LR as task head (FFN params), not encoder
+            optimizer.param_groups[1]['params'].append(mtl_loss.log_sigma)
+
         # Try to load optimizer state - only use start_epoch if optimizer loads successfully
         # (indicates resuming a finetune job vs starting fresh from pretrain checkpoint)
         if args.checkpoint_paths is not None and "optimizer" in loaded_ckpt_state:
@@ -243,9 +261,19 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
                                 num_workers=0,
                                 collate_fn=mol_collator)
         # Run training
-        best_score = float('inf') if args.minimize_score else -float('inf')
-        best_epoch, n_iter = 0, 0
-        min_val_loss = float('inf')
+        if args.task_wise_checkpoint:
+            best_score = {task: float('inf') if args.minimize_score else -float('inf') for task in args.task_names}
+            curr_epoch_best_by_loss = {}
+        else:
+            best_score = float('inf') if args.minimize_score else -float('inf')
+        best_epoch = {task: 0 for task in args.task_names}
+        n_iter = 0
+
+        # Initialize validation losses
+        if args.task_wise_checkpoint:
+            min_val_loss = {task: float('inf') for task in args.task_names}
+        else:
+            min_val_loss = float('inf')
         for epoch in range(start_epoch, args.epochs):
             s_time = time.time()
             n_iter, train_loss = train(
@@ -253,6 +281,7 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
                 model=model,
                 data=train_data,
                 loss_func=loss_func,
+                mtl_loss=mtl_loss,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 args=args,
@@ -275,6 +304,7 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
                 logger=logger,
                 args=args
             )
+            avg_val_loss = np.nanmean(val_loss)
             v_time = time.time() - s_time
             # Average validation score
             avg_val_score = np.nanmean(val_scores)
@@ -288,75 +318,153 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
                     debug(f'Validation {task_name} {args.metric} = {val_score:.6f}')
             print('Epoch: {:04d}'.format(epoch),
                   'loss_train: {:.6f}'.format(train_loss),
-                  'loss_val: {:.6f}'.format(val_loss),
+                  'loss_val: {:.6f}'.format(avg_val_loss),
                   f'{args.metric}_val: {avg_val_score:.4f}',
                   'cur_lr: {:.5f}'.format(scheduler.get_lr()[-1]),
                   't_time: {:.4f}s'.format(t_time),
                   'v_time: {:.4f}s'.format(v_time),
                   flush=True)
             if args.wandb_project:
-                wandb.log({
+                log_dict = {
                     "epoch": epoch,
                     "train/loss": train_loss,
                     "train/time": t_time,
                     "val/time": v_time,
-                    "val/loss": val_loss,
+                    "val/loss": avg_val_loss,
                     f"val/{args.metric}": avg_val_score,
                     "cur_lr": scheduler.get_lr()[-1],
-                })
+                }
+                if args.show_individual_scores:
+                    for task_name, val_score in zip(args.task_names, val_scores):
+                        log_dict[f"val/{task_name}_{args.metric}"] = val_score
+                wandb.log(log_dict)
 
             if args.tensorboard:
                 writer.add_scalar('loss/train', train_loss, epoch)
-                writer.add_scalar('loss/val', val_loss, epoch)
+                writer.add_scalar('loss/val', avg_val_loss, epoch)
                 writer.add_scalar(f'{args.metric}_val', avg_val_score, epoch)
 
             # Always update min_val_loss as it is needed for HPO
-            if val_loss < min_val_loss:
-                curr_epoch_best_by_loss = True
-                min_val_loss, best_epoch = val_loss, epoch
+            if args.task_wise_checkpoint:
+
+                for itask, task_name in enumerate(args.task_names):
+                    if val_loss[itask] < min_val_loss[task_name]:
+                        curr_epoch_best_by_loss[task_name] = True
+                        min_val_loss[task_name], best_epoch[task_name] = val_loss[itask], epoch
+                    else:
+                        curr_epoch_best_by_loss[task_name] = False
             else:
-                curr_epoch_best_by_loss = False
+                if avg_val_loss < min_val_loss:
+                    curr_epoch_best_by_loss = True
+                    min_val_loss, best_epoch = avg_val_loss, epoch
+                else:
+                    curr_epoch_best_by_loss = False
 
             save_model_for_restart(os.path.join(save_dir, 'last_checkpoint.pt'), model, optimizer, scheduler, scaler, features_scaler, args, 
             epoch+1 # save with +1 so that loaded checkpoint will start from the next epoch
             )
             # Save model checkpoint if improved validation score
-            if args.select_by_loss:
-                if curr_epoch_best_by_loss:
-                    save_checkpoint(os.path.join(save_dir, 'model.pt'), model, scaler, features_scaler, args)
+            if args.task_wise_checkpoint:
+                if args.select_by_loss:
+                    for task_name in args.task_names:
+                        if curr_epoch_best_by_loss[task_name]:
+                            print(f"Saving model {task_name} at epoch {epoch} with validation loss {min_val_loss[task_name]:.4f}")
+                            save_checkpoint(os.path.join(save_dir, f'model_{task_name}.pt'), model, scaler, features_scaler, args)
+                else:
+                    for itask, task_name in enumerate(args.task_names):
+                        task_val_score = val_scores[itask] if itask < len(val_scores) else avg_val_score
+                        if args.minimize_score and task_val_score < best_score[task_name] or \
+                                not args.minimize_score and task_val_score > best_score[task_name]:
+                            best_score[task_name], best_epoch[task_name] = task_val_score, epoch
+                            print(f"Saving model {task_name} at epoch {epoch} with validation score {best_score[task_name]:.4f}")
+                            save_checkpoint(os.path.join(save_dir, f'model_{task_name}.pt'), model, scaler, features_scaler, args)
             else:
-                if args.minimize_score and avg_val_score < best_score or \
-                        not args.minimize_score and avg_val_score > best_score:
-                    best_score, best_epoch = avg_val_score, epoch
-                    save_checkpoint(os.path.join(save_dir, 'model.pt'), model, scaler, features_scaler, args)
-
-            if epoch - best_epoch > args.early_stop_epoch:
-                break
+                if args.select_by_loss:
+                    if curr_epoch_best_by_loss:
+                        print(f"Saving model at epoch {epoch} with validation loss {min_val_loss:.4f}")
+                        save_checkpoint(os.path.join(save_dir, 'model.pt'), model, scaler, features_scaler, args)
+                else:
+                    if args.minimize_score and avg_val_score < best_score or \
+                            not args.minimize_score and avg_val_score > best_score:
+                        best_score, best_epoch = avg_val_score, epoch
+                        print(f"Saving model at epoch {epoch} with validation score {best_score:.4f}")
+                        save_checkpoint(os.path.join(save_dir, 'model.pt'), model, scaler, features_scaler, args)
+            # TODO: Reimplement this
+            # if epoch - best_epoch > args.early_stop_epoch:
+            #     break
 
         ensemble_scores = 0.0
 
         # Evaluate on test set using model with best validation score
         if args.select_by_loss:
-            info(f'Model {model_idx} best val loss = {min_val_loss:.6f} on epoch {best_epoch}')
+            if args.task_wise_checkpoint:
+                for task_name in args.task_names:
+                    info(f'Model {model_idx} best val loss = {min_val_loss[task_name]:.6f} on epoch {best_epoch[task_name]}')
+            else:
+                info(f'Model {model_idx} best val loss = {min_val_loss:.6f} on epoch {best_epoch}')
         else:
-            info(f'Model {model_idx} best validation {args.metric} = {best_score:.6f} on epoch {best_epoch}')
-        model, _ = load_checkpoint(os.path.join(save_dir, 'model.pt'), cuda=args.cuda, logger=logger)
+            if args.task_wise_checkpoint:
+                for task_name in args.task_names:
+                    info(f'Model {model_idx} best validation {args.metric} = {best_score[task_name]:.6f} on epoch {best_epoch[task_name]}')
+            else:
+                info(f'Model {model_idx} best validation {args.metric} = {best_score:.6f} on epoch {best_epoch}')
 
-        test_preds, _ = predict(
-            model=model,
-            data=test_data,
-            loss_func=None if is_blinded_test else loss_func,  # Skip loss calc for blinded data
-            batch_size=args.batch_size,
-            logger=logger,
-            shared_dict=shared_dict,
-            scaler=scaler,
-            args=args
-        )
+        if args.task_wise_checkpoint:
+            test_preds = np.zeros((len(test_data), args.num_tasks))
+            test_scores = []
+            _loss_func = None if is_blinded_test else loss_func
+            for itask, task_name in enumerate(args.task_names):
+                print(f"{itask=}, {task_name=}")
+                task_model, _ = load_checkpoint(os.path.join(save_dir, f'model_{task_name}.pt'), cuda=args.cuda, logger=logger)
+                test_preds_task, _ = predict(
+                    model=task_model,
+                    data=test_data,
+                    loss_func=_loss_func,
+                    batch_size=args.batch_size,
+                    logger=logger,
+                    shared_dict=shared_dict,
+                    scaler=scaler,
+                    args=args
+                )
+                if not is_blinded_test:
+                    test_scores_task = evaluate_predictions(
+                        preds=test_preds_task,
+                        targets=test_targets,
+                        num_tasks=args.num_tasks,
+                        metric_func=metric_func,
+                        dataset_type=args.dataset_type,
+                        logger=logger
+                    )
+                    test_scores.append(test_scores_task[itask])
+                test_preds[:, itask] = np.array(test_preds_task)[:, itask]
+            if is_blinded_test:
+                test_scores = [float('nan')] * args.num_tasks
+        else:
+            model, _ = load_checkpoint(os.path.join(save_dir, 'model.pt'), cuda=args.cuda, logger=logger)
+            test_preds, _ = predict(
+                model=model,
+                data=test_data,
+                loss_func=None if is_blinded_test else loss_func,
+                batch_size=args.batch_size,
+                logger=logger,
+                shared_dict=shared_dict,
+                scaler=scaler,
+                args=args
+            )
+            if not is_blinded_test:
+                test_scores = evaluate_predictions(
+                    preds=test_preds,
+                    targets=test_targets,
+                    num_tasks=args.num_tasks,
+                    metric_func=metric_func,
+                    dataset_type=args.dataset_type,
+                    logger=logger
+                )
 
         if len(test_preds) != 0:
             sum_test_preds += np.array(test_preds, dtype=float)
 
-        if not is_blinded_test:
+        if not is_blinded_test and not args.task_wise_checkpoint:
             test_scores = evaluate_predictions(
                 preds=test_preds,
                 targets=test_targets,
@@ -366,6 +474,7 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
                 logger=logger
             )
 
+        if not is_blinded_test:
             # Average test score
             avg_test_score = np.nanmean(test_scores)
             info(f'Model {model_idx} test {args.metric} = {avg_test_score:.6f}')
@@ -405,8 +514,6 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
             if args.show_individual_scores:
                 for task_name, ensemble_score in zip(args.task_names, ensemble_scores):
                     info(f'Ensemble test {task_name} {args.metric} = {ensemble_score:.6f}')
-
-# Log to wandb if enabled
             if args.wandb_project:
                 for task_name, ensemble_score in zip(args.task_names, ensemble_scores):
                     wandb.summary[f"test/{task_name}_{args.metric}"] = ensemble_score

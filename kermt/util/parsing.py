@@ -208,11 +208,12 @@ def add_finetune_args(parser: ArgumentParser):
                              'Note: Does NOT affect loss function used during training'
                              '(loss is determined by the `dataset_type` argument).'
                              'Note: Defaults to "auc" for classification and "rmse" for regression.')
+    parser.add_argument('--use_mtl_loss', action='store_true', default=False,
+                        help='Use MTL loss function')
     parser.add_argument('--show_individual_scores', action='store_true', default=False,
                         help='Show all scores for individual targets, not just average, at the end')
-
-
-
+    parser.add_argument('--task_wise_checkpoint', action='store_true', default=False,
+                        help='Checkpoint the model for each task separately')
 
     # Training arguments
     parser.add_argument('--epochs', type=int, default=30,
@@ -260,7 +261,9 @@ def add_finetune_args(parser: ArgumentParser):
     parser.add_argument('--ffn_num_layers', type=int, default=2,
                         help='Number of layers in FFN after MPN encoding')
     parser.add_argument('--ffn_task_specific_hidden_size', type=int, default=None,
-                        help='Number of task-specific layers in FFN after common FFN layer encoding')
+                        help='Hidden size for task-specific FFN layers (and common FFN '
+                             'output when task-specific layers are used). Required if '
+                             'ffn_num_task_specific_layers > 0.')
     parser.add_argument('--ffn_num_task_specific_layers', type=int, default=0,
                         help='Number of task-specific layers in FFN after common FFN layer encoding')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='weight_decay')

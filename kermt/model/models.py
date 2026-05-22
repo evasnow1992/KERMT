@@ -1351,7 +1351,7 @@ class KermtFinetuneTask(nn.Module):
         dropout_layer = nn.Dropout(dropout)
         activation_layer = get_activation_function(activation)
         if num_layers == 1:
-            ffn_ts = [dropout, nn.Linear(input_size, 1)]
+            ffn_ts = [dropout_layer, nn.Linear(input_size, 1)]
         else:
             ffn_ts = []
             for _ in range(num_layers - 1):
