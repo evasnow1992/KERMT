@@ -159,7 +159,8 @@ class KERMTTrainer:
                  scheduler,
                  gpu_id,
                  n_steps: int,
-                 logger: Logger = None):
+                 logger: Logger = None,
+                 shutdown_checker=None):
         """
         The init function of KERMTTrainer
         :param args: the input arguments
@@ -171,6 +172,7 @@ class KERMTTrainer:
         :param gpu_id: the gpu id
         :param n_steps: initial step count
         :param logger: the logger
+        :param shutdown_checker: callable that returns True if graceful shutdown requested
         """
 
         self.args = args
@@ -180,6 +182,7 @@ class KERMTTrainer:
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
         self.debug = logger.debug if logger is not None else print
+        self.shutdown_checker = shutdown_checker  # For graceful shutdown on cluster time limits
 
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -197,6 +200,7 @@ class KERMTTrainer:
         self.n_steps = n_steps
         self.first_epoch_post_resume = True
         self.curr_epoch_batch_idx = 0 # Number of batches to skip in first epoch of current training
+        self.batch_idx_offset = 0  # Offset to add when saving batch_idx (for sampler-level resume)
 
     def train(self, start_epoch: int, max_epochs: int) -> List:
         """
@@ -210,6 +214,11 @@ class KERMTTrainer:
             t_time = time.time() - s_time
             if self.gpu_id == 0:
                 print(f"epoch={epoch:04d}, cur_lr={self.scheduler.get_lr()[0]:.5f}, train_loss={train_loss:.6f}, train_time={t_time:.2f}", flush=True)
+            # After the resumed epoch completes, reset sampler and offset so
+            # subsequent epochs iterate over all samples from the beginning
+            if epoch == start_epoch and hasattr(self.train_dataloader.sampler, 'set_start_index'):
+                self.train_dataloader.sampler.set_start_index(0)
+                self.batch_idx_offset = 0
 
     def validation(self, max_val_batches: int) -> List:
         """
@@ -293,8 +302,16 @@ class KERMTTrainer:
         self.n_iter += self.args.batch_size
         return self.n_iter, cum_loss_sum, (0, 0, 0, 0, 0, 0)
 
-    def set_batch_idx(self, batch_idx: int):
+    def set_batch_idx(self, batch_idx: int, batch_idx_offset: int = 0):
+        """
+        Set batch index for resume logic.
+        
+        Args:
+            batch_idx: Number of batches to skip in training loop (0 if sampler handles skipping)
+            batch_idx_offset: Offset to add when saving batch_idx (for sampler-level resume)
+        """
         self.curr_epoch_batch_idx = batch_idx
+        self.batch_idx_offset = batch_idx_offset
 
     def iter(self, epoch, train=True) -> List:
         """
@@ -361,15 +378,25 @@ class KERMTTrainer:
             bv_dist_loss_sum += bv_dist_loss.item() if type(bv_dist_loss) != float else bv_dist_loss
             fg_dist_loss_sum += fg_dist_loss.item() if type(fg_dist_loss) != float else fg_dist_loss
 
-            # Save model
+            # Save model (batch_idx includes offset for sampler-level resume)
             if (self.gpu_id == 0)and (self.n_steps % self.args.save_interval) == 0:
-                self.save(batch_idx=ibatch, n_steps=self.n_steps, epoch=epoch, file_path=self.args.save_dir, name=f"model_step_{self.n_steps}.pt", save_last=True)
+                self.save(batch_idx=ibatch + self.batch_idx_offset, n_steps=self.n_steps, epoch=epoch, file_path=self.args.save_dir, name=f"model_step_{self.n_steps}.pt", save_last=True)
+
+            # Check for graceful shutdown (e.g., cluster time limit approaching)
+            if self.shutdown_checker is not None and self.shutdown_checker():
+                if self.gpu_id == 0:
+                    # Save checkpoint before exiting
+                    self.save(batch_idx=ibatch + self.batch_idx_offset, n_steps=self.n_steps, epoch=epoch, 
+                              file_path=self.args.save_dir, name=f"model_step_{self.n_steps}_shutdown.pt", save_last=True)
+                    print(f"[SHUTDOWN] Graceful shutdown complete. Saved at step {self.n_steps}, batch {ibatch + self.batch_idx_offset}", flush=True)
+                raise SystemExit(0)
 
             cum_iter_count += 1
             self.n_iter += self.args.batch_size
             self.n_steps += 1
 
-            if self.gpu_id == 0 and self.args.tensorboard and self.n_steps % 10 == 0:
+            train_log_interval = max(1, self.args.train_interval)
+            if self.gpu_id == 0 and self.args.tensorboard and self.n_steps % train_log_interval == 0:
                 self.writer.add_scalar('train/loss', loss.item(), self.n_steps)
                 self.writer.add_scalar('train/av_loss', av_loss.item(), self.n_steps)
                 self.writer.add_scalar('train/bv_loss', bv_loss.item(), self.n_steps)
@@ -379,7 +406,12 @@ class KERMTTrainer:
                 self.writer.add_scalar('train/fg_dist_loss', fg_dist_loss.item(), self.n_steps)
                 self.writer.add_scalar('train/lr', self.scheduler.get_lr()[0], self.n_steps)
                 self.writer.add_scalar('train/epoch', epoch, self.n_steps)
-                self.writer.add_scalar('train/batch_idx', ibatch, self.n_steps)
+                self.writer.add_scalar('train/batch_idx', ibatch + self.batch_idx_offset, self.n_steps)
+            # Optional: run validation every val_interval steps (similar to train metrics / save_interval)
+            val_interval = getattr(self.args, 'val_interval', 0)
+            if (val_interval > 0 and self.val_dataloader is not None
+                    and self.n_steps % val_interval == 0):
+                self.validation(max_val_batches=self.args.max_val_batches)
             # Debug only.
             # if i % 50 == 0:
             #     print(f"epoch: {epoch}, batch_id: {i}, av_loss: {av_loss}, bv_loss: {bv_loss}, "
@@ -410,8 +442,8 @@ class KERMTTrainer:
         :param save_last: whether to save the last model
         :return: the output path
         """
-return save_checkpoint(self.model, self.optimizer, self.args, batch_idx, 
-                              n_steps, epoch, file_path, name, save_last)
+        return save_checkpoint(self.model, self.optimizer, self.args, batch_idx, 
+                               n_steps, epoch, file_path, name, save_last)
 
 
     def save_tmp(self, epoch, file_path, rank=0):
@@ -463,7 +495,8 @@ class KERMTCMIMTrainer:
                  scheduler,
                  gpu_id,
                  n_steps: int,
-                 logger: Logger = None):
+                 logger: Logger = None,
+                 shutdown_checker=None):
         """
         The init function of KERMTCMIMTrainer
         :param args: the input arguments
@@ -475,6 +508,7 @@ class KERMTCMIMTrainer:
         :param gpu_id: the gpu id
         :param n_steps: initial step count
         :param logger: the logger
+        :param shutdown_checker: callable that returns True if graceful shutdown requested
         """
         self.args = args
         self.model = model
@@ -483,6 +517,7 @@ class KERMTCMIMTrainer:
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
         self.debug = logger.debug if logger is not None else print
+        self.shutdown_checker = shutdown_checker  # For graceful shutdown on cluster time limits
 
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -498,6 +533,7 @@ class KERMTCMIMTrainer:
         self.n_steps = n_steps
         self.first_epoch_post_resume = True
         self.curr_epoch_batch_idx = 0
+        self.batch_idx_offset = 0  # Offset to add when saving batch_idx (for sampler-level resume)
 
     def train(self, start_epoch: int, max_epochs: int) -> List:
         """
@@ -512,6 +548,11 @@ class KERMTCMIMTrainer:
             t_time = time.time() - s_time
             if self.gpu_id == 0:
                 print(f"epoch={epoch:04d}, cur_lr={self.scheduler.get_lr()[0]:.5f}, train_loss={train_loss:.6f}, train_time={t_time:.2f}", flush=True)
+            # After the resumed epoch completes, reset sampler and offset so
+            # subsequent epochs iterate over all samples from the beginning
+            if epoch == start_epoch and hasattr(self.train_dataloader.sampler, 'set_start_index'):
+                self.train_dataloader.sampler.set_start_index(0)
+                self.batch_idx_offset = 0
 
     def validation(self, max_val_batches: int) -> float:
         """
@@ -582,8 +623,16 @@ class KERMTCMIMTrainer:
         self.model.train()
         return loss_sum
 
-    def set_batch_idx(self, batch_idx: int):
+    def set_batch_idx(self, batch_idx: int, batch_idx_offset: int = 0):
+        """
+        Set batch index for resume logic.
+        
+        Args:
+            batch_idx: Number of batches to skip in training loop (0 if sampler handles skipping)
+            batch_idx_offset: Offset to add when saving batch_idx (for sampler-level resume)
+        """
         self.curr_epoch_batch_idx = batch_idx
+        self.batch_idx_offset = batch_idx_offset
 
     def iter(self, epoch, train=True) -> List:
         """
@@ -648,16 +697,26 @@ class KERMTCMIMTrainer:
             if self.args.tensorboard:
                 recon_accuracy_sum += recon_accuracy.item()
 
-            # Save model
+            # Save model (batch_idx includes offset for sampler-level resume)
             if (self.gpu_id == 0) and (self.n_steps % self.args.save_interval) == 0:
-                self.save(batch_idx=ibatch, n_steps=self.n_steps, epoch=epoch, 
+                self.save(batch_idx=ibatch + self.batch_idx_offset, n_steps=self.n_steps, epoch=epoch, 
                          file_path=self.args.save_dir, name=f"model_step_{self.n_steps}.pt", save_last=True)
+
+            # Check for graceful shutdown (e.g., cluster time limit approaching)
+            if self.shutdown_checker is not None and self.shutdown_checker():
+                if self.gpu_id == 0:
+                    # Save checkpoint before exiting
+                    self.save(batch_idx=ibatch + self.batch_idx_offset, n_steps=self.n_steps, epoch=epoch, 
+                              file_path=self.args.save_dir, name=f"model_step_{self.n_steps}_shutdown.pt", save_last=True)
+                    print(f"[SHUTDOWN] Graceful shutdown complete. Saved at step {self.n_steps}, batch {ibatch + self.batch_idx_offset}", flush=True)
+                raise SystemExit(0)
 
             cum_iter_count += 1
             self.n_iter += self.args.batch_size
             self.n_steps += 1
 
-            if self.gpu_id == 0 and self.args.tensorboard and self.n_steps % 10 == 0:
+            train_log_interval = max(1, self.args.train_interval)
+            if self.gpu_id == 0 and self.args.tensorboard and self.n_steps % train_log_interval == 0:
                 self.writer.add_scalar('train/loss', loss.item(), self.n_steps)
                 self.writer.add_scalar('train/recon_loss', recon_loss.item(), self.n_steps)
                 self.writer.add_scalar('train/cmim_loss', cmim_loss.item(), self.n_steps)
@@ -667,7 +726,12 @@ class KERMTCMIMTrainer:
                 self.writer.add_scalar('train/recon_accuracy', recon_accuracy.item(), self.n_steps)
                 self.writer.add_scalar('train/lr', self.scheduler.get_lr()[0], self.n_steps)
                 self.writer.add_scalar('train/epoch', epoch, self.n_steps)
-                self.writer.add_scalar('train/batch_idx', ibatch, self.n_steps)
+                self.writer.add_scalar('train/batch_idx', ibatch + self.batch_idx_offset, self.n_steps)
+            # Optional: run validation every val_interval steps (similar to train metrics / save_interval)
+            val_interval = getattr(self.args, 'val_interval', 0)
+            if (val_interval > 0 and self.val_dataloader is not None
+                    and self.n_steps % val_interval == 0):
+                self.validation(max_val_batches=self.args.max_val_batches)
 
         cum_loss_sum /= cum_iter_count
         cmim_loss_sum /= cum_iter_count
@@ -722,7 +786,8 @@ class KERMTHybridTrainer:
                  scheduler,
                  gpu_id,
                  n_steps: int,
-                 logger: Logger = None):
+                 logger: Logger = None,
+                 shutdown_checker=None):
         """
         The init function of KERMTHybridTrainer.
         
@@ -735,6 +800,7 @@ class KERMTHybridTrainer:
         :param gpu_id: the gpu id
         :param n_steps: initial step count
         :param logger: the logger
+        :param shutdown_checker: callable that returns True if graceful shutdown requested
         """
         self.args = args
         self.model = model
@@ -743,6 +809,7 @@ class KERMTHybridTrainer:
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
         self.debug = logger.debug if logger is not None else print
+        self.shutdown_checker = shutdown_checker  # For graceful shutdown on cluster time limits
 
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -758,6 +825,7 @@ class KERMTHybridTrainer:
         self.n_steps = n_steps
         self.first_epoch_post_resume = True
         self.curr_epoch_batch_idx = 0
+        self.batch_idx_offset = 0  # Offset to add when saving batch_idx (for sampler-level resume)
 
     def train(self, start_epoch: int, max_epochs: int) -> List:
         """
@@ -773,6 +841,11 @@ class KERMTHybridTrainer:
             if self.gpu_id == 0:
                 print(f"epoch={epoch:04d}, cur_lr={self.scheduler.get_lr()[0]:.5f}, "
                       f"train_loss={train_loss:.6f}, train_time={t_time:.2f}", flush=True)
+            # After the resumed epoch completes, reset sampler and offset so
+            # subsequent epochs iterate over all samples from the beginning
+            if epoch == start_epoch and hasattr(self.train_dataloader.sampler, 'set_start_index'):
+                self.train_dataloader.sampler.set_start_index(0)
+                self.batch_idx_offset = 0
 
     def validation(self, max_val_batches: int) -> float:
         """
@@ -866,8 +939,16 @@ class KERMTHybridTrainer:
         self.model.train()
         return loss_sum
 
-    def set_batch_idx(self, batch_idx: int):
+    def set_batch_idx(self, batch_idx: int, batch_idx_offset: int = 0):
+        """
+        Set batch index for resume logic.
+        
+        Args:
+            batch_idx: Number of batches to skip in training loop (0 if sampler handles skipping)
+            batch_idx_offset: Offset to add when saving batch_idx (for sampler-level resume)
+        """
         self.curr_epoch_batch_idx = batch_idx
+        self.batch_idx_offset = batch_idx_offset
 
     def iter(self, epoch, train=True) -> List:
         """
@@ -953,16 +1034,26 @@ class KERMTHybridTrainer:
             bv_loss_sum += bv_loss.item() if not isinstance(bv_loss, float) else bv_loss
             fg_loss_sum += fg_loss.item() if not isinstance(fg_loss, float) else fg_loss
 
-            # Save model
+            # Save model (batch_idx includes offset for sampler-level resume)
             if (self.gpu_id == 0) and (self.n_steps % self.args.save_interval) == 0:
-                self.save(batch_idx=ibatch, n_steps=self.n_steps, epoch=epoch,
+                self.save(batch_idx=ibatch + self.batch_idx_offset, n_steps=self.n_steps, epoch=epoch,
                          file_path=self.args.save_dir, name=f"model_step_{self.n_steps}.pt", save_last=True)
+
+            # Check for graceful shutdown (e.g., cluster time limit approaching)
+            if self.shutdown_checker is not None and self.shutdown_checker():
+                if self.gpu_id == 0:
+                    # Save checkpoint before exiting
+                    self.save(batch_idx=ibatch + self.batch_idx_offset, n_steps=self.n_steps, epoch=epoch,
+                              file_path=self.args.save_dir, name=f"model_step_{self.n_steps}_shutdown.pt", save_last=True)
+                    print(f"[SHUTDOWN] Graceful shutdown complete. Saved at step {self.n_steps}, batch {ibatch + self.batch_idx_offset}", flush=True)
+                raise SystemExit(0)
 
             cum_iter_count += 1
             self.n_iter += self.args.batch_size
             self.n_steps += 1
 
-            if self.gpu_id == 0 and self.args.tensorboard and self.n_steps % 10 == 0:
+            train_log_interval = max(1, self.args.train_interval)
+            if self.gpu_id == 0 and self.args.tensorboard and self.n_steps % train_log_interval == 0:
                 self.writer.add_scalar('train/loss', overall_loss.item(), self.n_steps)
                 self.writer.add_scalar('train/cmim_total', cmim_total.item(), self.n_steps)
                 self.writer.add_scalar('train/recon_loss', recon_loss.item(), self.n_steps)
@@ -982,7 +1073,12 @@ class KERMTHybridTrainer:
                 self.writer.add_scalar('train/fg_loss', fg_loss_val, self.n_steps)
                 self.writer.add_scalar('train/lr', self.scheduler.get_lr()[0], self.n_steps)
                 self.writer.add_scalar('train/epoch', epoch, self.n_steps)
-                self.writer.add_scalar('train/batch_idx', ibatch, self.n_steps)
+                self.writer.add_scalar('train/batch_idx', ibatch + self.batch_idx_offset, self.n_steps)
+            # Optional: run validation every val_interval steps (similar to train metrics / save_interval)
+            val_interval = getattr(self.args, 'val_interval', 0)
+            if (val_interval > 0 and self.val_dataloader is not None
+                    and self.n_steps % val_interval == 0):
+                self.validation(max_val_batches=self.args.max_val_batches)
 
         cum_loss_sum /= cum_iter_count
         cmim_loss_sum /= cum_iter_count

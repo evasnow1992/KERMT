@@ -30,12 +30,103 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed import init_process_group, destroy_process_group
 import os
+import signal
+import threading
+
+# ============================================================================
+# Graceful Shutdown Handling
+# ============================================================================
+# This allows the training to checkpoint and exit cleanly when the cluster
+# sends a signal (e.g., SIGUSR1 before time limit, or SIGTERM).
+# This is shared across all spawned processes via multiprocessing.Value.
+
+# Global shutdown event (used within each process)
+_SHUTDOWN_REQUESTED = threading.Event()
+
+def _graceful_shutdown_handler(signum, frame):
+    """Signal handler for graceful shutdown."""
+    signal_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+    print(f"[SIGNAL] Received {signal_name}. Requesting graceful shutdown...", flush=True)
+    _SHUTDOWN_REQUESTED.set()
+
+def setup_signal_handlers():
+    """
+    Set up signal handlers for graceful shutdown.
+    
+    SIGUSR1: Commonly used by SLURM to warn before time limit
+    SIGTERM: Standard termination signal
+    SIGINT: Ctrl+C on workstations
+    
+    Call this in each spawned process if you want graceful shutdown.
+    """
+    # SIGUSR1 is commonly used by SLURM for pre-termination warning
+    signal.signal(signal.SIGUSR1, _graceful_shutdown_handler)
+    # SIGTERM is the standard termination signal
+    signal.signal(signal.SIGTERM, _graceful_shutdown_handler)
+    # SIGINT is Ctrl+C - useful for graceful shutdown on workstations
+    signal.signal(signal.SIGINT, _graceful_shutdown_handler)
+    print("[INFO] Signal handlers set up for graceful shutdown (SIGUSR1, SIGTERM, SIGINT)", flush=True)
+
+def is_shutdown_requested():
+    """Check if graceful shutdown has been requested."""
+    return _SHUTDOWN_REQUESTED.is_set()
+
+
+class ResumableDistributedSampler(DistributedSampler):
+    """
+    A DistributedSampler that supports resuming from a specific batch index.
+    
+    This is crucial for large datasets where we can only complete a fraction of an epoch
+    per job. Instead of loading and skipping batches (slow), we skip at the index level
+    (fast - no data loading needed for skipped samples).
+    
+    Key features:
+    - Deterministic shuffle when set_epoch() is called (same as parent class)
+    - Can skip the first N samples efficiently
+    - Properly handles the reduced dataset length after skipping
+    """
+    
+    def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True, 
+                 seed=0, drop_last=False, start_index=0):
+        """
+        Args:
+            start_index: Number of samples to skip (per rank). This should be
+                        batch_idx * batch_size from the checkpoint.
+        """
+        super().__init__(dataset, num_replicas, rank, shuffle, seed, drop_last)
+        self.start_index = start_index
+        self._original_num_samples = self.num_samples
+    
+    def set_start_index(self, start_index: int):
+        """Set the number of samples to skip (for resuming mid-epoch)."""
+        self.start_index = start_index
+    
+    def __iter__(self):
+        # Get the full list of indices from parent class
+        indices = list(super().__iter__())
+        
+        # Skip the first start_index samples
+        if self.start_index > 0 and self.start_index < len(indices):
+            indices = indices[self.start_index:]
+        
+        return iter(indices)
+    
+    def __len__(self):
+        # Return the number of samples we'll actually yield
+        remaining = self._original_num_samples - self.start_index
+        return max(0, remaining)
 
 
 from kermt.data.kermtdataset import (
     get_data, split_data, 
     KermtCollator, KermtDecoderCollator, KermtHybridCollator,
-    get_pretokenized_data, KermtPreTokenizedDecoderCollator
+    get_pretokenized_data, KermtPreTokenizedDecoderCollator,
+    # Memory-mapped feature classes for multi-worker hybrid/vocab training
+    get_pretokenized_data_with_features,  # For hybrid mode (needs tokens + features)
+    get_features_only_data,  # For vocab mode (only needs features, more efficient)
+    KermtVocabFeaturesOnlyCollator,  # Optimized collator for vocab mode 
+    KermtHybridPreTokenizedCollator,
+    KermtVocabPreTokenizedCollator
 )
 from kermt.util.utils import create_logger
 from kermt.model.models import KERMTEmbedding
@@ -100,6 +191,10 @@ def ddp_setup(rank, world_size):
 
 def main(rank: int, world_size: int):
     ddp_setup(rank, world_size)
+    
+    # Set up signal handlers for graceful shutdown on cluster time limits
+    if rank == 0:
+        setup_signal_handlers()
 
     # parse args
     args = parse_args_ddp()
@@ -113,25 +208,134 @@ def main(rank: int, world_size: int):
     # For hybrid and vocab modes, we need features for functional group prediction
     load_features = args.pretrain_mode != 'cmim'
     
-    # Check if using pre-tokenized data (memory-efficient CMIM training)
-    use_pretokenized = (args.pretrain_mode == 'cmim' and 
-                        hasattr(args, 'tokens_dir') and 
-                        args.tokens_dir is not None)
+    # Check if using memory-mapped data (memory-efficient training)
+    # CMIM mode: only needs tokens_dir (pre-tokenized SMILES)
+    # Hybrid mode: needs both tokens_dir AND features_mmap_dir
+    # Vocab mode: only needs features_mmap_dir (tokens not used!)
+    has_tokens_dir = hasattr(args, 'tokens_dir') and args.tokens_dir is not None
+    has_features_mmap = hasattr(args, 'features_mmap_dir') and args.features_mmap_dir is not None
     
-    # Track whether val uses pre-tokenized data (needed for collator selection)
+    use_pretokenized_cmim = (args.pretrain_mode == 'cmim' and has_tokens_dir)
+    use_features_only_vocab = (args.pretrain_mode == 'vocab' and has_features_mmap)  # Optimized: no tokens needed
+    use_pretokenized_with_features = (args.pretrain_mode == 'hybrid' and has_tokens_dir and has_features_mmap)
+    
+    # Track whether val uses memory-mapped data (needed for collator selection)
     val_use_pretokenized = False
+    val_use_features_only = False
     
-    if use_pretokenized:
+    if use_features_only_vocab:
+        # Optimized vocab mode: only load features and SMILES (no pre-tokenized SMILES)
+        # This is more efficient than use_pretokenized_with_features for vocab mode
+        if rank == 0:
+            print(f"[INFO] Using features-only data for vocab training (optimized mode)")
+            print(f"[INFO] Features mmap directory: {args.features_mmap_dir}")
+            print(f"[INFO] SMILES cache size: {args.max_cached_files} files")
+
+        train_features_mmap_dir = args.features_mmap_dir
+        train_data, train_sample_per_file = get_features_only_data(
+            data_path=args.train_data_path,
+            features_mmap_dir=train_features_mmap_dir,
+            max_smiles_cache_files=args.max_cached_files
+        )
+        train_data_size = len(train_data)
+        if rank == 0:
+            print(f"Training data size: {train_data_size}")
+        
+        if args.val_data_path is not None:
+            # Infer val directory: replace 'train' with 'val' in path
+            val_features_mmap_dir = args.features_mmap_dir.replace('/train/', '/val/')
+            if val_features_mmap_dir == args.features_mmap_dir:
+                val_features_mmap_dir = os.path.join(os.path.dirname(args.features_mmap_dir), 'val', 'feature_mmap')
+            
+            if os.path.exists(val_features_mmap_dir):
+                val_data, val_sample_per_file = get_features_only_data(
+                    data_path=args.val_data_path,
+                    features_mmap_dir=val_features_mmap_dir,
+                    max_smiles_cache_files=args.max_cached_files
+                )
+                val_data_size = len(val_data)
+                val_use_features_only = True
+                if rank == 0:
+                    print(f"Validation data size: {val_data_size}")
+            else:
+                if rank == 0:
+                    print(f"[WARNING] Val features directory not found: {val_features_mmap_dir}")
+                    print("[WARNING] Falling back to standard data loading for validation")
+                val_data, val_sample_per_file = get_data(data_path=args.val_data_path, load_features=load_features)
+                val_data_size = len(val_data)
+                val_use_features_only = False
+                pre_load_data_ddp(val_data, val_data_size, val_sample_per_file)
+        else:
+            val_data = None
+            val_data_size = 0
+    
+    elif use_pretokenized_with_features:
+        # Memory-efficient loading with pre-tokenized .npy files AND memory-mapped features
+        # This enables multi-worker data loading for hybrid training
+        if rank == 0:
+            print(f"[INFO] Using pre-tokenized data with memory-mapped features for {args.pretrain_mode} training")
+            print(f"[INFO] Tokens directory: {args.tokens_dir}")
+            print(f"[INFO] Features mmap directory: {args.features_mmap_dir}")
+            print(f"[INFO] SMILES cache size: {args.max_cached_files} files")
+
+        train_tokens_dir = args.tokens_dir
+        train_features_mmap_dir = args.features_mmap_dir
+        train_data, train_sample_per_file = get_pretokenized_data_with_features(
+            data_path=args.train_data_path,
+            tokens_dir=train_tokens_dir,
+            features_mmap_dir=train_features_mmap_dir,
+            max_smiles_cache_files=args.max_cached_files
+        )
+        train_data_size = len(train_data)
+        if rank == 0:
+            print(f"Training data size: {train_data_size}")
+        
+        if args.val_data_path is not None:
+            # Infer val directories: replace 'train' with 'val' in paths
+            val_tokens_dir = args.tokens_dir.replace('/train/', '/val/')
+            val_features_mmap_dir = args.features_mmap_dir.replace('/train/', '/val/')
+            
+            if val_tokens_dir == args.tokens_dir:
+                val_tokens_dir = os.path.join(os.path.dirname(args.tokens_dir), 'val', 'tokens')
+            if val_features_mmap_dir == args.features_mmap_dir:
+                val_features_mmap_dir = os.path.join(os.path.dirname(args.features_mmap_dir), 'val', 'feature_mmap')
+            
+            if os.path.exists(val_tokens_dir) and os.path.exists(val_features_mmap_dir):
+                val_data, val_sample_per_file = get_pretokenized_data_with_features(
+                    data_path=args.val_data_path,
+                    tokens_dir=val_tokens_dir,
+                    features_mmap_dir=val_features_mmap_dir,
+                    max_smiles_cache_files=args.max_cached_files
+                )
+                val_data_size = len(val_data)
+                val_use_pretokenized = True
+                if rank == 0:
+                    print(f"Validation data size: {val_data_size}")
+            else:
+                if rank == 0:
+                    print(f"[WARNING] Val directories not found (tokens: {val_tokens_dir}, features: {val_features_mmap_dir})")
+                    print("[WARNING] Falling back to standard data loading for validation")
+                val_data, val_sample_per_file = get_data(data_path=args.val_data_path, load_features=load_features)
+                val_data_size = len(val_data)
+                val_use_pretokenized = False
+                pre_load_data_ddp(val_data, val_data_size, val_sample_per_file)
+        else:
+            val_data = None
+            val_data_size = 0
+    
+    elif use_pretokenized_cmim:
         # Memory-efficient loading with pre-tokenized .npy files
         if rank == 0:
             print("[INFO] Using pre-tokenized data for CMIM training (memory-efficient mode)")
             print(f"[INFO] Tokens directory: {args.tokens_dir}")
-        
+            print(f"[INFO] SMILES cache size: {args.max_cached_files} files")
+
         # Construct tokens_dir for train and val
         train_tokens_dir = args.tokens_dir
         train_data, train_sample_per_file = get_pretokenized_data(
-            data_path=args.train_data_path, 
-            tokens_dir=train_tokens_dir
+            data_path=args.train_data_path,
+            tokens_dir=train_tokens_dir,
+            max_smiles_cache_files=args.max_cached_files
         )
         train_data_size = len(train_data)
         if rank == 0:
@@ -148,7 +352,8 @@ def main(rank: int, world_size: int):
             if os.path.exists(val_tokens_dir):
                 val_data, val_sample_per_file = get_pretokenized_data(
                     data_path=args.val_data_path,
-                    tokens_dir=val_tokens_dir
+                    tokens_dir=val_tokens_dir,
+                    max_smiles_cache_files=args.max_cached_files
                 )
                 val_data_size = len(val_data)
                 val_use_pretokenized = True
@@ -212,7 +417,7 @@ def main(rank: int, world_size: int):
         test_data = None
         test_data_size = 0
 
-    train_sampler = DistributedSampler(
+    train_sampler = ResumableDistributedSampler(
             train_data, num_replicas=world_size, rank=rank, shuffle=True)
     
     if args.val_data_path is not None:
@@ -253,15 +458,39 @@ def main(rank: int, world_size: int):
         if rank == 0:
             print(f"[INFO] SMILES vocabulary size: {smiles_vocab_size}")
             print(f"[INFO] Atom vocabulary size: {atom_vocab_size}, Bond vocabulary size: {bond_vocab_size}")
-        # Hybrid training - use KermtHybridCollator
-        mol_collator = KermtHybridCollator(
-            shared_dict=shared_dict,
-            smiles_vocab=smiles_vocab,
-            atom_vocab=atom_vocab,
-            bond_vocab=bond_vocab,
-            args=args
-        )
-        val_collator = mol_collator
+        
+        # Hybrid training - use appropriate collator based on data type
+        if use_pretokenized_with_features:
+            if rank == 0:
+                print("[INFO] Using KermtHybridPreTokenizedCollator for train (memory-efficient multi-worker)")
+            mol_collator = KermtHybridPreTokenizedCollator(
+                shared_dict=shared_dict,
+                smiles_vocab=smiles_vocab,
+                atom_vocab=atom_vocab,
+                bond_vocab=bond_vocab,
+                args=args
+            )
+            if val_use_pretokenized:
+                val_collator = mol_collator
+            else:
+                if rank == 0 and val_data is not None:
+                    print("[INFO] Using KermtHybridCollator for val (standard data)")
+                val_collator = KermtHybridCollator(
+                    shared_dict=shared_dict,
+                    smiles_vocab=smiles_vocab,
+                    atom_vocab=atom_vocab,
+                    bond_vocab=bond_vocab,
+                    args=args
+                )
+        else:
+            mol_collator = KermtHybridCollator(
+                shared_dict=shared_dict,
+                smiles_vocab=smiles_vocab,
+                atom_vocab=atom_vocab,
+                bond_vocab=bond_vocab,
+                args=args
+            )
+            val_collator = mol_collator
     elif args.pretrain_mode == 'cmim':
         # CMIM mode - only needs SMILES vocabulary
         if args.smiles_vocab_path is None:
@@ -277,7 +506,7 @@ def main(rank: int, world_size: int):
             print(f"[INFO] SMILES vocabulary size: {smiles_vocab_size}")
         
         # CMIM training - use appropriate collator based on data type
-        if use_pretokenized:
+        if use_pretokenized_cmim:
             if rank == 0:
                 print("[INFO] Using KermtPreTokenizedDecoderCollator for train (memory-efficient)")
             mol_collator = KermtPreTokenizedDecoderCollator(
@@ -318,14 +547,38 @@ def main(rank: int, world_size: int):
         atom_vocab_size, bond_vocab_size = len(atom_vocab), len(bond_vocab)
         if rank == 0:
             print(f"[INFO] Atom vocabulary size: {atom_vocab_size}, Bond vocabulary size: {bond_vocab_size}")
-        # Vocab-based pretraining - use KermtCollator
-        mol_collator = KermtCollator(
-            shared_dict=shared_dict,
-            atom_vocab=atom_vocab,
-            bond_vocab=bond_vocab,
-            args=args
-        )
-        val_collator = mol_collator
+        
+        # Vocab-based pretraining - use appropriate collator based on data type
+        if use_features_only_vocab:
+            # Optimized: uses features-only data (no pre-tokenized SMILES loaded)
+            if rank == 0:
+                print("[INFO] Using KermtVocabFeaturesOnlyCollator for train (optimized multi-worker)")
+            mol_collator = KermtVocabFeaturesOnlyCollator(
+                shared_dict=shared_dict,
+                atom_vocab=atom_vocab,
+                bond_vocab=bond_vocab,
+                args=args
+            )
+            if val_use_features_only:
+                val_collator = mol_collator
+            else:
+                if rank == 0 and val_data is not None:
+                    print("[INFO] Using KermtCollator for val (standard data)")
+                val_collator = KermtCollator(
+                    shared_dict=shared_dict,
+                    atom_vocab=atom_vocab,
+                    bond_vocab=bond_vocab,
+                    args=args
+                )
+        else:
+            # Standard mode: uses BatchMolDataset
+            mol_collator = KermtCollator(
+                shared_dict=shared_dict,
+                atom_vocab=atom_vocab,
+                bond_vocab=bond_vocab,
+                args=args
+            )
+            val_collator = mol_collator
 
     train_dataloader = DataLoader(train_data, batch_size=args.batch_size, # batch size per GPU (aka micro batch size)
                                   shuffle=False, # because train_sampler does the shuffling
@@ -421,7 +674,8 @@ def main(rank: int, world_size: int):
             scheduler=scheduler,
             gpu_id=rank,
             n_steps=0,
-            logger=logger
+            logger=logger,
+            shutdown_checker=is_shutdown_requested
         )
     elif args.pretrain_mode == 'cmim':
         if rank == 0:
@@ -435,7 +689,8 @@ def main(rank: int, world_size: int):
             scheduler=scheduler,
             gpu_id=rank,
             n_steps=0,
-            logger=logger
+            logger=logger,
+            shutdown_checker=is_shutdown_requested
         )
     else:  # args.pretrain_mode == 'vocab'
         if rank == 0:
@@ -449,7 +704,8 @@ def main(rank: int, world_size: int):
             scheduler=scheduler,
             gpu_id=rank,
             n_steps=0,
-            logger=logger
+            logger=logger,
+            shutdown_checker=is_shutdown_requested
         )
 
     if args.save_dir is not None:
@@ -465,10 +721,25 @@ def main(rank: int, world_size: int):
 
     steps_per_epoch = train_data_size // (args.batch_size*world_size)
     print(f"Steps per epoch: {steps_per_epoch}")
-    curr_epoch_batch_idx = scheduler_step % steps_per_epoch
-    print(f"Current epoch batch index: {curr_epoch_batch_idx}")
-
-    trainer.set_batch_idx(prev_batch_idx)
+    
+    # Resume mid-epoch by setting sampler start index (efficient - no data loading for skipped samples)
+    # This works because:
+    # 1. set_epoch() ensures deterministic shuffle order (called in trainer.iter())
+    # 2. The sampler skips indices at the index level, not by loading and discarding
+    # 3. The trainer doesn't need to skip batches - sampler handles it
+    if prev_batch_idx > 0:
+        # Calculate samples to skip: batch_idx * batch_size
+        samples_to_skip = prev_batch_idx * args.batch_size
+        train_sampler.set_start_index(samples_to_skip)
+        if rank == 0:
+            print(f"[INFO] Resuming mid-epoch: skipping first {prev_batch_idx} batches ({samples_to_skip} samples)")
+            print(f"[INFO] Sampler will yield {len(train_sampler)} remaining batches")
+    
+    # Tell trainer:
+    # - batch_idx=0: don't skip batches in training loop (sampler handles it)
+    # - batch_idx_offset=prev_batch_idx: add this when saving so checkpoint has correct batch_idx
+    trainer.set_batch_idx(0, batch_idx_offset=prev_batch_idx)
+    
     # Train model
     trainer.train(start_epoch=epoch, max_epochs=args.epochs)
     destroy_process_group()
