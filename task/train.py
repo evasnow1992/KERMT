@@ -48,7 +48,10 @@ from typing import List
 
 import numpy as np
 import pandas as pd
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 import torch
 from torch.optim.lr_scheduler import ExponentialLR
 from torch.utils.data import DataLoader

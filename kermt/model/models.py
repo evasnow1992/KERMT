@@ -923,8 +923,8 @@ class KermtCMIMTask(nn.Module):
         recon_loss_weight = args.reconstruction_loss_weight
         normalize_gradient = args.normalize_gradient
         normalize_loss = args.normalize_loss
-        compute_accuracy = args.tensorboard  # Only compute accuracy if TensorBoard logging is enabled
-        
+        compute_accuracy = args.tensorboard or bool(getattr(args, 'wandb_project', None))
+
         def loss_func(preds: Dict[str, torch.Tensor], targets=None):
             """
             The loss function for KermtCMIMTask with reconstruction.
@@ -1112,7 +1112,7 @@ class KermtHybridTask(nn.Module):
         recon_loss_weight = args.reconstruction_loss_weight
         normalize_gradient = args.normalize_gradient
         normalize_loss = args.normalize_loss
-        compute_accuracy = args.tensorboard
+        compute_accuracy = args.tensorboard or bool(getattr(args, 'wandb_project', None))
         dist_coff = args.dist_coff
         vocab_loss_weight = self.vocab_loss_weight
         

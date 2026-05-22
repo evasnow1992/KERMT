@@ -53,7 +53,10 @@ from kermt.util.utils import get_task_names
 from kermt.util.utils import makedirs
 from task.run_evaluation import run_evaluation
 from task.train import run_training
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 def cross_validate(args: Namespace, logger: Logger = None) -> Tuple[float, float]:
     """

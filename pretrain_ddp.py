@@ -708,11 +708,12 @@ def main(rank: int, world_size: int):
             shutdown_checker=is_shutdown_requested
         )
 
+    wandb_run_id = None
     if args.save_dir is not None:
         last_ckpt_path = os.path.join(args.save_dir, "last_checkpoint.pt")
         if os.path.exists(last_ckpt_path):
             print(f"Loading checkpoint from {last_ckpt_path}")
-            epoch, scheduler_step, prev_batch_idx = trainer.load(last_ckpt_path)
+            epoch, scheduler_step, prev_batch_idx, wandb_run_id = trainer.load(last_ckpt_path)
             print(f"Loaded checkpoint from epoch={epoch}, scheduler_step={scheduler_step}, prev_batch_idx={prev_batch_idx}")
         else:
             epoch = 0
@@ -739,9 +740,42 @@ def main(rank: int, world_size: int):
     # - batch_idx=0: don't skip batches in training loop (sampler handles it)
     # - batch_idx_offset=prev_batch_idx: add this when saving so checkpoint has correct batch_idx
     trainer.set_batch_idx(0, batch_idx_offset=prev_batch_idx)
-    
+
+    # Initialize WandB on rank 0 (before training starts so resumed runs attach correctly)
+    if rank == 0 and getattr(args, 'wandb_project', None):
+        try:
+            import wandb
+            wandb.login()
+            if wandb_run_id:
+                print(f"[INFO] Resuming WandB run: {wandb_run_id}", flush=True)
+            wandb.init(
+                project=args.wandb_project,
+                name=getattr(args, 'wandb_run_name', None),
+                id=wandb_run_id,  # None for new runs, restored from checkpoint for restarts
+                config=vars(args),
+                dir=args.save_dir if hasattr(args, 'save_dir') else None,
+                resume="allow"
+            )
+            print(f"[INFO] WandB initialized: project={args.wandb_project}, run_id={wandb.run.id}", flush=True)
+        except ImportError:
+            print("[WARNING] wandb not installed, skipping WandB logging", flush=True)
+            args.wandb_project = None
+        except Exception as e:
+            print(f"[WARNING] WandB initialization failed: {e}", flush=True)
+            print("[WARNING] Continuing without WandB logging", flush=True)
+            args.wandb_project = None
+
     # Train model
     trainer.train(start_epoch=epoch, max_epochs=args.epochs)
+
+    # Finish WandB run
+    if rank == 0 and getattr(args, 'wandb_project', None):
+        try:
+            import wandb
+            wandb.finish()
+        except Exception:
+            pass
+
     destroy_process_group()
 
 

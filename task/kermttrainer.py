@@ -59,6 +59,10 @@ from torch.utils.data import DataLoader
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 # ============================================================================
@@ -89,6 +93,11 @@ def save_checkpoint(model, optimizer, args, batch_idx, n_steps, epoch,
     
     scaler = None
     features_scaler = None
+    # Capture WandB run ID so restarts can resume the same run
+    wandb_run_id = None
+    if wandb is not None and wandb.run is not None:
+        wandb_run_id = wandb.run.id
+
     state = {
         'args': args,
         'state_dict': model.module.state_dict(),
@@ -103,7 +112,8 @@ def save_checkpoint(model, optimizer, args, batch_idx, n_steps, epoch,
         'features_scaler': {
             'means': features_scaler.means,
             'stds': features_scaler.stds
-        } if features_scaler is not None else None
+        } if features_scaler is not None else None,
+        'wandb_run_id': wandb_run_id,
     }
     # Use atomic save pattern: write to .tmp then rename
     # This prevents corrupted checkpoints if the process is killed mid-write
@@ -121,32 +131,39 @@ def save_checkpoint(model, optimizer, args, batch_idx, n_steps, epoch,
     return output_path
 
 
-def load_checkpoint(checkpoint_path, model, optimizer, scheduler) -> Tuple[int, int, int]:
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler) -> Tuple[int, int, int, ...]:
     """
     Load model checkpoint. Shared by both KERMTTrainer and KERMTCMIMTrainer.
-    
+
     :param checkpoint_path: path to checkpoint file
     :param model: the model (wrapped in DDP)
     :param optimizer: the optimizer
     :param scheduler: the learning rate scheduler
-    :return: tuple of (epoch, scheduler_step, batch_idx)
+    :return: tuple of (epoch, scheduler_step, batch_idx, wandb_run_id)
     """
     if not os.path.exists(checkpoint_path):
         print(f"Checkpoint {checkpoint_path} not found")
-        return 0, 0, 0
-    
+        return 0, 0, 0, None
+
     # TODO(sveccham): Change this to weights_only=True
     ckpt = torch.load(checkpoint_path, weights_only=False)
     model.module.load_state_dict(ckpt["state_dict"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.current_step = ckpt["scheduler_step"]
-    
+
     epoch = ckpt["epoch"]
     scheduler_step = ckpt["scheduler_step"]
     batch_idx = ckpt["batch_idx"]
-    
+    wandb_run_id = ckpt.get("wandb_run_id", None)
+
     print(f"Batch index from loaded checkpoint: {batch_idx}", flush=True)
-    return epoch, scheduler_step, batch_idx
+    return epoch, scheduler_step, batch_idx, wandb_run_id
+
+
+def _wandb_log(args, gpu_id, log_dict, step=None):
+    """Log metrics to WandB if enabled and on rank 0."""
+    if gpu_id == 0 and wandb is not None and getattr(args, 'wandb_project', None):
+        wandb.log(log_dict, step=step)
 
 
 class KERMTTrainer:
@@ -269,11 +286,16 @@ class KERMTTrainer:
 
         if self.gpu_id == 0:
             print(f"Validation loss: {loss_sum:.4f}, av_loss: {av_loss_sum:.4f}, bv_loss: {bv_loss_sum:.4f}, fg_loss: {fg_loss_sum:.4f}", flush=True)
+            val_metrics = {
+                'val/loss': loss_sum,
+                'val/av_loss': av_loss_sum,
+                'val/bv_loss': bv_loss_sum,
+                'val/fg_loss': fg_loss_sum,
+            }
             if self.args.tensorboard:
-                self.writer.add_scalar('val/loss', loss_sum, self.n_steps)
-                self.writer.add_scalar('val/av_loss', av_loss_sum, self.n_steps)
-                self.writer.add_scalar('val/bv_loss', bv_loss_sum, self.n_steps)
-                self.writer.add_scalar('val/fg_loss', fg_loss_sum, self.n_steps)
+                for k, v in val_metrics.items():
+                    self.writer.add_scalar(k, v, self.n_steps)
+            _wandb_log(self.args, self.gpu_id, val_metrics, step=self.n_steps)
 
         self.model.train()
         return loss_sum
@@ -381,6 +403,8 @@ class KERMTTrainer:
             # Save model (batch_idx includes offset for sampler-level resume)
             if (self.gpu_id == 0)and (self.n_steps % self.args.save_interval) == 0:
                 self.save(batch_idx=ibatch + self.batch_idx_offset, n_steps=self.n_steps, epoch=epoch, file_path=self.args.save_dir, name=f"model_step_{self.n_steps}.pt", save_last=True)
+                if self.args.tensorboard:
+                    self.writer.flush()
 
             # Check for graceful shutdown (e.g., cluster time limit approaching)
             if self.shutdown_checker is not None and self.shutdown_checker():
@@ -388,6 +412,9 @@ class KERMTTrainer:
                     # Save checkpoint before exiting
                     self.save(batch_idx=ibatch + self.batch_idx_offset, n_steps=self.n_steps, epoch=epoch, 
                               file_path=self.args.save_dir, name=f"model_step_{self.n_steps}_shutdown.pt", save_last=True)
+                    if self.args.tensorboard:
+                        self.writer.flush()
+                        self.writer.close()
                     print(f"[SHUTDOWN] Graceful shutdown complete. Saved at step {self.n_steps}, batch {ibatch + self.batch_idx_offset}", flush=True)
                 raise SystemExit(0)
 
@@ -396,17 +423,23 @@ class KERMTTrainer:
             self.n_steps += 1
 
             train_log_interval = max(1, self.args.train_interval)
-            if self.gpu_id == 0 and self.args.tensorboard and self.n_steps % train_log_interval == 0:
-                self.writer.add_scalar('train/loss', loss.item(), self.n_steps)
-                self.writer.add_scalar('train/av_loss', av_loss.item(), self.n_steps)
-                self.writer.add_scalar('train/bv_loss', bv_loss.item(), self.n_steps)
-                self.writer.add_scalar('train/fg_loss', fg_loss.item(), self.n_steps)
-                self.writer.add_scalar('train/av_dist_loss', av_dist_loss.item(), self.n_steps)
-                self.writer.add_scalar('train/bv_dist_loss', bv_dist_loss.item(), self.n_steps)
-                self.writer.add_scalar('train/fg_dist_loss', fg_dist_loss.item(), self.n_steps)
-                self.writer.add_scalar('train/lr', self.scheduler.get_lr()[0], self.n_steps)
-                self.writer.add_scalar('train/epoch', epoch, self.n_steps)
-                self.writer.add_scalar('train/batch_idx', ibatch + self.batch_idx_offset, self.n_steps)
+            if self.gpu_id == 0 and self.n_steps % train_log_interval == 0:
+                train_metrics = {
+                    'train/loss': loss.item(),
+                    'train/av_loss': av_loss.item(),
+                    'train/bv_loss': bv_loss.item(),
+                    'train/fg_loss': fg_loss.item(),
+                    'train/av_dist_loss': av_dist_loss.item(),
+                    'train/bv_dist_loss': bv_dist_loss.item(),
+                    'train/fg_dist_loss': fg_dist_loss.item(),
+                    'train/lr': self.scheduler.get_lr()[0],
+                    'train/epoch': epoch,
+                    'train/batch_idx': ibatch + self.batch_idx_offset,
+                }
+                if self.args.tensorboard:
+                    for k, v in train_metrics.items():
+                        self.writer.add_scalar(k, v, self.n_steps)
+                _wandb_log(self.args, self.gpu_id, train_metrics, step=self.n_steps)
             # Optional: run validation every val_interval steps (similar to train metrics / save_interval)
             val_interval = getattr(self.args, 'val_interval', 0)
             if (val_interval > 0 and self.val_dataloader is not None
@@ -468,17 +501,17 @@ class KERMTTrainer:
         }
         torch.save(state, store_path)
 
-    def load(self, checkpoint_path) -> Tuple[int, int, int]:
+    def load(self, checkpoint_path):
         """
         Load checkpoint for training.
         :param checkpoint_path: path to checkpoint file
-        :return: tuple of (epoch, scheduler_step, batch_idx)
+        :return: tuple of (epoch, scheduler_step, batch_idx, wandb_run_id)
         """
-        epoch, scheduler_step, batch_idx = load_checkpoint(
+        epoch, scheduler_step, batch_idx, wandb_run_id = load_checkpoint(
             checkpoint_path, self.model, self.optimizer, self.scheduler
         )
         self.n_steps = scheduler_step
-        return epoch, scheduler_step, batch_idx
+        return epoch, scheduler_step, batch_idx, wandb_run_id
 
 
 class KERMTCMIMTrainer:
@@ -611,14 +644,19 @@ class KERMTCMIMTrainer:
                 print(f"Validation loss: {loss_sum:.4f}, recon_loss: {recon_loss_sum:.4f}, cmim_loss: {cmim_loss_sum:.4f}, "
                       f"log_p_k1: {log_p_k1_sum:.4f}, log_q_z: {log_q_z_sum:.4f}, log_P_z: {log_P_z_sum:.4f}", flush=True)
             
+            val_metrics = {
+                'val/loss': loss_sum,
+                'val/recon_loss': recon_loss_sum,
+                'val/cmim_loss': cmim_loss_sum,
+                'val/log_p_k1_given_zx': log_p_k1_sum,
+                'val/log_q_z_given_x': log_q_z_sum,
+                'val/log_P_z': log_P_z_sum,
+                'val/recon_accuracy': recon_accuracy_sum,
+            }
             if self.args.tensorboard:
-                self.writer.add_scalar('val/loss', loss_sum, self.n_steps)
-                self.writer.add_scalar('val/recon_loss', recon_loss_sum, self.n_steps)
-                self.writer.add_scalar('val/cmim_loss', cmim_loss_sum, self.n_steps)
-                self.writer.add_scalar('val/log_p_k1_given_zx', log_p_k1_sum, self.n_steps)
-                self.writer.add_scalar('val/log_q_z_given_x', log_q_z_sum, self.n_steps)
-                self.writer.add_scalar('val/log_P_z', log_P_z_sum, self.n_steps)
-                self.writer.add_scalar('val/recon_accuracy', recon_accuracy_sum, self.n_steps)
+                for k, v in val_metrics.items():
+                    self.writer.add_scalar(k, v, self.n_steps)
+            _wandb_log(self.args, self.gpu_id, val_metrics, step=self.n_steps)
 
         self.model.train()
         return loss_sum
@@ -701,6 +739,8 @@ class KERMTCMIMTrainer:
             if (self.gpu_id == 0) and (self.n_steps % self.args.save_interval) == 0:
                 self.save(batch_idx=ibatch + self.batch_idx_offset, n_steps=self.n_steps, epoch=epoch, 
                          file_path=self.args.save_dir, name=f"model_step_{self.n_steps}.pt", save_last=True)
+                if self.args.tensorboard:
+                    self.writer.flush()
 
             # Check for graceful shutdown (e.g., cluster time limit approaching)
             if self.shutdown_checker is not None and self.shutdown_checker():
@@ -708,6 +748,9 @@ class KERMTCMIMTrainer:
                     # Save checkpoint before exiting
                     self.save(batch_idx=ibatch + self.batch_idx_offset, n_steps=self.n_steps, epoch=epoch, 
                               file_path=self.args.save_dir, name=f"model_step_{self.n_steps}_shutdown.pt", save_last=True)
+                    if self.args.tensorboard:
+                        self.writer.flush()
+                        self.writer.close()
                     print(f"[SHUTDOWN] Graceful shutdown complete. Saved at step {self.n_steps}, batch {ibatch + self.batch_idx_offset}", flush=True)
                 raise SystemExit(0)
 
@@ -716,17 +759,23 @@ class KERMTCMIMTrainer:
             self.n_steps += 1
 
             train_log_interval = max(1, self.args.train_interval)
-            if self.gpu_id == 0 and self.args.tensorboard and self.n_steps % train_log_interval == 0:
-                self.writer.add_scalar('train/loss', loss.item(), self.n_steps)
-                self.writer.add_scalar('train/recon_loss', recon_loss.item(), self.n_steps)
-                self.writer.add_scalar('train/cmim_loss', cmim_loss.item(), self.n_steps)
-                self.writer.add_scalar('train/log_p_k1_given_zx', log_p_k1.item(), self.n_steps)
-                self.writer.add_scalar('train/log_q_z_given_x', log_q_z.item(), self.n_steps)
-                self.writer.add_scalar('train/log_P_z', log_P_z.item(), self.n_steps)
-                self.writer.add_scalar('train/recon_accuracy', recon_accuracy.item(), self.n_steps)
-                self.writer.add_scalar('train/lr', self.scheduler.get_lr()[0], self.n_steps)
-                self.writer.add_scalar('train/epoch', epoch, self.n_steps)
-                self.writer.add_scalar('train/batch_idx', ibatch + self.batch_idx_offset, self.n_steps)
+            if self.gpu_id == 0 and self.n_steps % train_log_interval == 0:
+                train_metrics = {
+                    'train/loss': loss.item(),
+                    'train/recon_loss': recon_loss.item(),
+                    'train/cmim_loss': cmim_loss.item(),
+                    'train/log_p_k1_given_zx': log_p_k1.item(),
+                    'train/log_q_z_given_x': log_q_z.item(),
+                    'train/log_P_z': log_P_z.item(),
+                    'train/recon_accuracy': recon_accuracy.item(),
+                    'train/lr': self.scheduler.get_lr()[0],
+                    'train/epoch': epoch,
+                    'train/batch_idx': ibatch + self.batch_idx_offset,
+                }
+                if self.args.tensorboard:
+                    for k, v in train_metrics.items():
+                        self.writer.add_scalar(k, v, self.n_steps)
+                _wandb_log(self.args, self.gpu_id, train_metrics, step=self.n_steps)
             # Optional: run validation every val_interval steps (similar to train metrics / save_interval)
             val_interval = getattr(self.args, 'val_interval', 0)
             if (val_interval > 0 and self.val_dataloader is not None
@@ -759,17 +808,17 @@ class KERMTCMIMTrainer:
         return save_checkpoint(self.model, self.optimizer, self.args, batch_idx, 
                               n_steps, epoch, file_path, name, save_last)
 
-    def load(self, checkpoint_path) -> Tuple[int, int, int]:
+    def load(self, checkpoint_path):
         """
         Load checkpoint for CMIM training.
         :param checkpoint_path: path to checkpoint file
-        :return: tuple of (epoch, scheduler_step, batch_idx)
+        :return: tuple of (epoch, scheduler_step, batch_idx, wandb_run_id)
         """
-        epoch, scheduler_step, batch_idx = load_checkpoint(
+        epoch, scheduler_step, batch_idx, wandb_run_id = load_checkpoint(
             checkpoint_path, self.model, self.optimizer, self.scheduler
         )
         self.n_steps = scheduler_step
-        return epoch, scheduler_step, batch_idx
+        return epoch, scheduler_step, batch_idx, wandb_run_id
 
 
 class KERMTHybridTrainer:
@@ -892,7 +941,7 @@ class KERMTHybridTrainer:
             log_p_k1_sum += log_p_k1.item()
             log_q_z_sum += log_q_z.item()
             log_P_z_sum += log_P_z.item()
-            if self.args.tensorboard and recon_accuracy is not None:
+            if recon_accuracy is not None:
                 recon_accuracy_sum += recon_accuracy.item()
             vocab_loss_sum += vocab_overall.item() if not isinstance(vocab_overall, float) else vocab_overall
             av_loss_sum += av_loss.item() if not isinstance(av_loss, float) else av_loss
@@ -911,8 +960,7 @@ class KERMTHybridTrainer:
         log_p_k1_sum /= n_batches
         log_q_z_sum /= n_batches
         log_P_z_sum /= n_batches
-        if self.args.tensorboard:
-            recon_accuracy_sum /= n_batches
+        recon_accuracy_sum /= n_batches
         vocab_loss_sum /= n_batches
         av_loss_sum /= n_batches
         bv_loss_sum /= n_batches
@@ -922,19 +970,24 @@ class KERMTHybridTrainer:
             print(f"Validation loss: {loss_sum:.4f}, cmim_total: {cmim_total_sum:.4f}, "
                   f"vocab_loss: {vocab_loss_sum:.4f}, recon_loss: {recon_loss_sum:.4f}", flush=True)
             
+            val_metrics = {
+                'val/loss': loss_sum,
+                'val/cmim_total': cmim_total_sum,
+                'val/recon_loss': recon_loss_sum,
+                'val/cmim_loss': cmim_loss_sum,
+                'val/log_p_k1_given_zx': log_p_k1_sum,
+                'val/log_q_z_given_x': log_q_z_sum,
+                'val/log_P_z': log_P_z_sum,
+                'val/recon_accuracy': recon_accuracy_sum,
+                'val/vocab_loss': vocab_loss_sum,
+                'val/av_loss': av_loss_sum,
+                'val/bv_loss': bv_loss_sum,
+                'val/fg_loss': fg_loss_sum,
+            }
             if self.args.tensorboard:
-                self.writer.add_scalar('val/loss', loss_sum, self.n_steps)
-                self.writer.add_scalar('val/cmim_total', cmim_total_sum, self.n_steps)
-                self.writer.add_scalar('val/recon_loss', recon_loss_sum, self.n_steps)
-                self.writer.add_scalar('val/cmim_loss', cmim_loss_sum, self.n_steps)
-                self.writer.add_scalar('val/log_p_k1_given_zx', log_p_k1_sum, self.n_steps)
-                self.writer.add_scalar('val/log_q_z_given_x', log_q_z_sum, self.n_steps)
-                self.writer.add_scalar('val/log_P_z', log_P_z_sum, self.n_steps)
-                self.writer.add_scalar('val/recon_accuracy', recon_accuracy_sum, self.n_steps)
-                self.writer.add_scalar('val/vocab_loss', vocab_loss_sum, self.n_steps)
-                self.writer.add_scalar('val/av_loss', av_loss_sum, self.n_steps)
-                self.writer.add_scalar('val/bv_loss', bv_loss_sum, self.n_steps)
-                self.writer.add_scalar('val/fg_loss', fg_loss_sum, self.n_steps)
+                for k, v in val_metrics.items():
+                    self.writer.add_scalar(k, v, self.n_steps)
+            _wandb_log(self.args, self.gpu_id, val_metrics, step=self.n_steps)
 
         self.model.train()
         return loss_sum
@@ -1027,7 +1080,7 @@ class KERMTHybridTrainer:
             log_p_k1_sum += log_p_k1.item()
             log_q_z_sum += log_q_z.item()
             log_P_z_sum += log_P_z.item()
-            if self.args.tensorboard and recon_accuracy is not None:
+            if recon_accuracy is not None:
                 recon_accuracy_sum += recon_accuracy.item()
             vocab_loss_sum += vocab_overall.item() if not isinstance(vocab_overall, float) else vocab_overall
             av_loss_sum += av_loss.item() if not isinstance(av_loss, float) else av_loss
@@ -1038,6 +1091,8 @@ class KERMTHybridTrainer:
             if (self.gpu_id == 0) and (self.n_steps % self.args.save_interval) == 0:
                 self.save(batch_idx=ibatch + self.batch_idx_offset, n_steps=self.n_steps, epoch=epoch,
                          file_path=self.args.save_dir, name=f"model_step_{self.n_steps}.pt", save_last=True)
+                if self.args.tensorboard:
+                    self.writer.flush()
 
             # Check for graceful shutdown (e.g., cluster time limit approaching)
             if self.shutdown_checker is not None and self.shutdown_checker():
@@ -1045,6 +1100,9 @@ class KERMTHybridTrainer:
                     # Save checkpoint before exiting
                     self.save(batch_idx=ibatch + self.batch_idx_offset, n_steps=self.n_steps, epoch=epoch,
                               file_path=self.args.save_dir, name=f"model_step_{self.n_steps}_shutdown.pt", save_last=True)
+                    if self.args.tensorboard:
+                        self.writer.flush()
+                        self.writer.close()
                     print(f"[SHUTDOWN] Graceful shutdown complete. Saved at step {self.n_steps}, batch {ibatch + self.batch_idx_offset}", flush=True)
                 raise SystemExit(0)
 
@@ -1053,27 +1111,33 @@ class KERMTHybridTrainer:
             self.n_steps += 1
 
             train_log_interval = max(1, self.args.train_interval)
-            if self.gpu_id == 0 and self.args.tensorboard and self.n_steps % train_log_interval == 0:
-                self.writer.add_scalar('train/loss', overall_loss.item(), self.n_steps)
-                self.writer.add_scalar('train/cmim_total', cmim_total.item(), self.n_steps)
-                self.writer.add_scalar('train/recon_loss', recon_loss.item(), self.n_steps)
-                self.writer.add_scalar('train/cmim_loss', cmim_loss.item(), self.n_steps)
-                self.writer.add_scalar('train/log_p_k1_given_zx', log_p_k1.item(), self.n_steps)
-                self.writer.add_scalar('train/log_q_z_given_x', log_q_z.item(), self.n_steps)
-                self.writer.add_scalar('train/log_P_z', log_P_z.item(), self.n_steps)
-                if recon_accuracy is not None:
-                    self.writer.add_scalar('train/recon_accuracy', recon_accuracy.item(), self.n_steps)
+            if self.gpu_id == 0 and self.n_steps % train_log_interval == 0:
                 vocab_overall_val = vocab_overall.item() if not isinstance(vocab_overall, float) else vocab_overall
                 av_loss_val = av_loss.item() if not isinstance(av_loss, float) else av_loss
                 bv_loss_val = bv_loss.item() if not isinstance(bv_loss, float) else bv_loss
                 fg_loss_val = fg_loss.item() if not isinstance(fg_loss, float) else fg_loss
-                self.writer.add_scalar('train/vocab_loss', vocab_overall_val, self.n_steps)
-                self.writer.add_scalar('train/av_loss', av_loss_val, self.n_steps)
-                self.writer.add_scalar('train/bv_loss', bv_loss_val, self.n_steps)
-                self.writer.add_scalar('train/fg_loss', fg_loss_val, self.n_steps)
-                self.writer.add_scalar('train/lr', self.scheduler.get_lr()[0], self.n_steps)
-                self.writer.add_scalar('train/epoch', epoch, self.n_steps)
-                self.writer.add_scalar('train/batch_idx', ibatch + self.batch_idx_offset, self.n_steps)
+                train_metrics = {
+                    'train/loss': overall_loss.item(),
+                    'train/cmim_total': cmim_total.item(),
+                    'train/recon_loss': recon_loss.item(),
+                    'train/cmim_loss': cmim_loss.item(),
+                    'train/log_p_k1_given_zx': log_p_k1.item(),
+                    'train/log_q_z_given_x': log_q_z.item(),
+                    'train/log_P_z': log_P_z.item(),
+                    'train/vocab_loss': vocab_overall_val,
+                    'train/av_loss': av_loss_val,
+                    'train/bv_loss': bv_loss_val,
+                    'train/fg_loss': fg_loss_val,
+                    'train/lr': self.scheduler.get_lr()[0],
+                    'train/epoch': epoch,
+                    'train/batch_idx': ibatch + self.batch_idx_offset,
+                }
+                if recon_accuracy is not None:
+                    train_metrics['train/recon_accuracy'] = recon_accuracy.item()
+                if self.args.tensorboard:
+                    for k, v in train_metrics.items():
+                        self.writer.add_scalar(k, v, self.n_steps)
+                _wandb_log(self.args, self.gpu_id, train_metrics, step=self.n_steps)
             # Optional: run validation every val_interval steps (similar to train metrics / save_interval)
             val_interval = getattr(self.args, 'val_interval', 0)
             if (val_interval > 0 and self.val_dataloader is not None
@@ -1095,15 +1159,14 @@ class KERMTHybridTrainer:
         return save_checkpoint(self.model, self.optimizer, self.args, batch_idx,
                               n_steps, epoch, file_path, name, save_last)
 
-    def load(self, checkpoint_path) -> Tuple[int, int, int]:
+    def load(self, checkpoint_path):
         """
         Load checkpoint for hybrid training.
         :param checkpoint_path: path to checkpoint file
-        :return: tuple of (epoch, scheduler_step, batch_idx)
+        :return: tuple of (epoch, scheduler_step, batch_idx, wandb_run_id)
         """
-        epoch, scheduler_step, batch_idx = load_checkpoint(
+        epoch, scheduler_step, batch_idx, wandb_run_id = load_checkpoint(
             checkpoint_path, self.model, self.optimizer, self.scheduler
         )
         self.n_steps = scheduler_step
-        return epoch, scheduler_step, batch_idx
-    
+        return epoch, scheduler_step, batch_idx, wandb_run_id

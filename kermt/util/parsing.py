@@ -488,10 +488,14 @@ def add_pretrain_args(parser: ArgumentParser):
                         help='Directory where model checkpoints will be saved')
     parser.add_argument('--save_interval', type=int, default=100, 
                         help='Model saving interval (in steps).')
-    parser.add_argument("--tensorboard", action="store_true", default=False, 
+    parser.add_argument("--tensorboard", action="store_true", default=False,
                         help="Use tensorboard to visualize training.")
     parser.add_argument('--train_interval', type=int, default=10,
                         help='Log train metrics to TensorBoard every N steps (default: 10).')
+    parser.add_argument('--wandb_project', type=str, default=None,
+                        help='Wandb project name. If provided, WandB will be used to log pretraining metrics.')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                        help='Wandb run name')
 
 def update_checkpoint_args(args: Namespace):
     """
