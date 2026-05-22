@@ -57,11 +57,13 @@ def setup_cuik_molmaker_features(args):
     ]
     bond_props = ["is-null", "bond-type-onehot", "conjugated", "in-ring", "stereo"]
     
-    # Form feature tensors
+    # Form feature arrays. cuik_molmaker 0.2 renamed these from
+    # `_feature_names_to_tensor` to `_feature_names_to_array`; commit 3aedca8
+    # adopted the new API in molgraph.py + features.py but missed this site.
     cmm_feature_tensors = {
-        "atom_onehot": cuik_molmaker.atom_onehot_feature_names_to_tensor(atom_onehot_props),
-        "atom_float": cuik_molmaker.atom_float_feature_names_to_tensor(atom_float_props),
-        "bond": cuik_molmaker.bond_feature_names_to_tensor(bond_props)
+        "atom_onehot": cuik_molmaker.atom_onehot_feature_names_to_array(atom_onehot_props),
+        "atom_float": cuik_molmaker.atom_float_feature_names_to_array(atom_float_props),
+        "bond": cuik_molmaker.bond_feature_names_to_array(bond_props)
     }
     
     # Get feature ranges

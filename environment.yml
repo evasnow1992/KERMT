@@ -18,3 +18,4 @@ dependencies:
   - wandb
   - setuptools>=80.0.0,<82.0.0
   - protobuf>=5.29.5
+  - pytest
