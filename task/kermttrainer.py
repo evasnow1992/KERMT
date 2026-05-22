@@ -53,72 +53,137 @@ import os
 import time
 from logging import Logger
 from typing import List, Tuple
-from collections.abc import Callable
 import torch
 from torch.nn import Module
 from torch.utils.data import DataLoader
-from torch.cuda import nvtx
 
-from kermt.model.models import KermtTask
-from kermt.util.scheduler import NoamLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
+
+
+# ============================================================================
+# Shared helper functions for checkpoint saving/loading
+# ============================================================================
+
+def save_checkpoint(model, optimizer, args, batch_idx, n_steps, epoch, 
+                   file_path, name=None, save_last=False) -> str:
+    """
+    Save model checkpoint. Shared by both KERMTTrainer and KERMTCMIMTrainer.
+    
+    :param model: the model (wrapped in DDP)
+    :param optimizer: the optimizer
+    :param args: training arguments
+    :param batch_idx: current batch index
+    :param n_steps: current step number
+    :param epoch: current epoch
+    :param file_path: directory to save checkpoint
+    :param name: optional custom filename
+    :param save_last: whether to also save as 'last_checkpoint.pt'
+    :return: path to saved checkpoint
+    """
+    now = time.localtime()
+    if name is None:
+        name = "_%04d_%02d_%02d_%02d_%02d_%02d" % (
+            now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, now.tm_min, now.tm_sec)
+    output_path = os.path.join(file_path, name)
+    
+    scaler = None
+    features_scaler = None
+    state = {
+        'args': args,
+        'state_dict': model.module.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler_step': n_steps,
+        'batch_idx': batch_idx,
+        "epoch": epoch,
+        'data_scaler': {
+            'means': scaler.means,
+            'stds': scaler.stds
+        } if scaler is not None else None,
+        'features_scaler': {
+            'means': features_scaler.means,
+            'stds': features_scaler.stds
+        } if features_scaler is not None else None
+    }
+    # Use atomic save pattern: write to .tmp then rename
+    # This prevents corrupted checkpoints if the process is killed mid-write
+    tmp_output_path = output_path + ".tmp"
+    torch.save(state, tmp_output_path)
+    os.replace(tmp_output_path, output_path)  # atomic on POSIX
+    
+    if save_last:
+        last_path = os.path.join(file_path, "last_checkpoint.pt")
+        tmp_last_path = last_path + ".tmp"
+        torch.save(state, tmp_last_path)
+        os.replace(tmp_last_path, last_path)  # atomic on POSIX
+
+    print(f"Model at step={n_steps} saved at {output_path}", flush=True)
+    return output_path
+
+
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler) -> Tuple[int, int, int]:
+    """
+    Load model checkpoint. Shared by both KERMTTrainer and KERMTCMIMTrainer.
+    
+    :param checkpoint_path: path to checkpoint file
+    :param model: the model (wrapped in DDP)
+    :param optimizer: the optimizer
+    :param scheduler: the learning rate scheduler
+    :return: tuple of (epoch, scheduler_step, batch_idx)
+    """
+    if not os.path.exists(checkpoint_path):
+        print(f"Checkpoint {checkpoint_path} not found")
+        return 0, 0, 0
+    
+    # TODO(sveccham): Change this to weights_only=True
+    ckpt = torch.load(checkpoint_path, weights_only=False)
+    model.module.load_state_dict(ckpt["state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    scheduler.current_step = ckpt["scheduler_step"]
+    
+    epoch = ckpt["epoch"]
+    scheduler_step = ckpt["scheduler_step"]
+    batch_idx = ckpt["batch_idx"]
+    
+    print(f"Batch index from loaded checkpoint: {batch_idx}", flush=True)
+    return epoch, scheduler_step, batch_idx
+
+
 class KERMTTrainer:
     def __init__(self,
                  args,
-                 embedding_model: Module,
-                 atom_vocab_size: int,  # atom vocab size
-                 bond_vocab_size: int,
-                 fg_szie: int,
+                 model: Module,
                  train_dataloader: DataLoader,
                  val_dataloader: DataLoader,
-                 world_size: int,
+                 optimizer,
+                 scheduler,
                  gpu_id,
                  n_steps: int,
                  logger: Logger = None):
         """
         The init function of KERMTTrainer
-        :param args: the input arguments.
-        :param embedding_model: the model to generate atom/bond embeddings.
-        :param atom_vocab_size: the vocabulary size of atoms.
-        :param bond_vocab_size: the vocabulary size of bonds.
-        :param fg_szie: the size of semantic motifs (functional groups)
-        :param train_dataloader: the training dataloader.
-        :param val_dataloader: the validation dataloader.
-        :param world_size: the world size.
-        :param gpu_id: the gpu id.
+        :param args: the input arguments
+        :param model: the complete KermtTask model (created externally)
+        :param train_dataloader: the training dataloader
+        :param val_dataloader: the validation dataloader
+        :param optimizer: the optimizer (built on model.parameters())
+        :param scheduler: the scheduler
+        :param gpu_id: the gpu id
+        :param n_steps: initial step count
         :param logger: the logger
         """
 
         self.args = args
-        self.kermt = embedding_model
-        self.model = KermtTask(args, embedding_model, atom_vocab_size, bond_vocab_size, fg_szie)
+        self.model = model
         self.loss_func = self.model.get_loss_func(args)
         self.gpu_id = gpu_id
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
-        self.atom_vocab_size = atom_vocab_size
-        self.bond_vocab_size = bond_vocab_size
         self.debug = logger.debug if logger is not None else print
 
-        # Build optimizer with all parameters
-        ## NOTE: This is different for KermtFinetuneTask and KERMTEmbedding
-        ## KermtEmbedding version used here
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=args.init_lr, weight_decay=args.weight_decay)
+        self.optimizer = optimizer
+        self.scheduler = scheduler
 
-        steps_per_epoch = train_dataloader.dataset.len // (args.batch_size*world_size)
-        self.scheduler = NoamLR(
-            optimizer=self.optimizer,
-            warmup_epochs=args.warmup_epochs,
-            total_epochs=args.epochs,
-            steps_per_epoch=steps_per_epoch,
-            init_lr=args.init_lr,
-            max_lr=args.max_lr,
-            final_lr=args.final_lr,
-            fine_tune_coff=args.fine_tune_coff
-        )
-
-        self.args = args
         self.n_iter = 0
 
         self.model.to(self.gpu_id)
@@ -337,53 +402,17 @@ class KERMTTrainer:
     def save(self, batch_idx, n_steps, epoch, file_path, name=None, save_last=False) -> str:
         """
         Save the intermediate models during training.
-        :param n_steps: the step number.
-        :param epoch: the epoch number.
-        :param file_path: the file_path to save the model.
-        :param save_last: whether to save the last model.
-        :return: the output path.
+        :param batch_idx: the batch index
+        :param n_steps: the step number
+        :param epoch: the epoch number
+        :param file_path: the file_path to save the model
+        :param name: optional custom filename
+        :param save_last: whether to save the last model
+        :return: the output path
         """
-        # add specific time in model fine name, in order to distinguish different saved models
-        now = time.localtime()
-        if name is None:
-            name = "_%04d_%02d_%02d_%02d_%02d_%02d" % (
-                now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, now.tm_min, now.tm_sec)
-        output_path = os.path.join(file_path, name)
-        scaler = None
-        features_scaler = None
-        state = {
-            'args': self.args,
-            'state_dict': self.model.module.state_dict(), # changed to self.model.module.state_dict() from self.model.state_dict()
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler_step': n_steps,
-            'batch_idx': batch_idx,
-            "epoch": epoch,
-            'data_scaler': {
-                'means': scaler.means,
-                'stds': scaler.stds
-            } if scaler is not None else None,
-            'features_scaler': {
-                'means': features_scaler.means,
-                'stds': features_scaler.stds
-            } if features_scaler is not None else None
-        }
-        # Use atomic save pattern: write to .tmp then rename
-        # This prevents corrupted checkpoints if the process is killed mid-write
-        tmp_output_path = output_path + ".tmp"
-        torch.save(state, tmp_output_path)
-        os.replace(tmp_output_path, output_path)  # atomic on POSIX
-        
-        if save_last:
-            last_path = os.path.join(file_path, "last_checkpoint.pt")
-            tmp_last_path = last_path + ".tmp"
-            torch.save(state, tmp_last_path)
-            os.replace(tmp_last_path, last_path)  # atomic on POSIX
+return save_checkpoint(self.model, self.optimizer, self.args, batch_idx, 
+                              n_steps, epoch, file_path, name, save_last)
 
-        # Is this necessary?
-        # if self.with_cuda:
-        #    self.model = self.model.cuda()
-        print(f"Model at step={n_steps} saved at {output_path}", flush=True)
-        return output_path
 
     def save_tmp(self, epoch, file_path, rank=0):
         """
@@ -407,19 +436,274 @@ class KERMTTrainer:
         }
         torch.save(state, store_path)
 
-    def load(self, checkpoint_path) -> Tuple[int, int]:
-        if not os.path.exists(checkpoint_path):
-            print(f"Checkpoint {checkpoint_path} not found")
-            return
-        # TODO(sveccham): Change this to weights_only=True
-        ckpt = torch.load(checkpoint_path, weights_only=False)
-        self.model.module.load_state_dict(ckpt["state_dict"])
-        self.optimizer.load_state_dict(ckpt["optimizer"])
-        self.scheduler.current_step = ckpt["scheduler_step"]
-        epoch = ckpt["epoch"]
-        scheduler_step = ckpt["scheduler_step"]
-        batch_idx = ckpt["batch_idx"]
-        print(f"Batch index from loaded checkpoint: {batch_idx}")
+    def load(self, checkpoint_path) -> Tuple[int, int, int]:
+        """
+        Load checkpoint for training.
+        :param checkpoint_path: path to checkpoint file
+        :return: tuple of (epoch, scheduler_step, batch_idx)
+        """
+        epoch, scheduler_step, batch_idx = load_checkpoint(
+            checkpoint_path, self.model, self.optimizer, self.scheduler
+        )
+        self.n_steps = scheduler_step
+        return epoch, scheduler_step, batch_idx
+
+
+class KERMTCMIMTrainer:
+    """
+    Trainer for CMIM pretraining.
+    Uses contrastive learning without vocabulary prediction tasks.
+    """
+    def __init__(self,
+                 args,
+                 model: Module,
+                 train_dataloader: DataLoader,
+                 val_dataloader: DataLoader,
+                 optimizer,
+                 scheduler,
+                 gpu_id,
+                 n_steps: int,
+                 logger: Logger = None):
+        """
+        The init function of KERMTCMIMTrainer
+        :param args: the input arguments
+        :param model: the complete KermtCMIMTask model (created externally)
+        :param train_dataloader: the training dataloader
+        :param val_dataloader: the validation dataloader
+        :param optimizer: the optimizer (built on model.parameters())
+        :param scheduler: the scheduler
+        :param gpu_id: the gpu id
+        :param n_steps: initial step count
+        :param logger: the logger
+        """
+        self.args = args
+        self.model = model
+        self.loss_func = self.model.get_loss_func(args)
+        self.gpu_id = gpu_id
+        self.train_dataloader = train_dataloader
+        self.val_dataloader = val_dataloader
+        self.debug = logger.debug if logger is not None else print
+
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+
+        self.n_iter = 0
+
+        self.model.to(self.gpu_id)
+        self.model = DDP(self.model, device_ids=[gpu_id])
+
+        if self.args.tensorboard:
+            self.writer = SummaryWriter(self.args.save_dir)
+
+        self.n_steps = n_steps
+        self.first_epoch_post_resume = True
+        self.curr_epoch_batch_idx = 0
+
+    def train(self, start_epoch: int, max_epochs: int) -> List:
+        """
+        The training iteration
+        :param start_epoch: starting epoch number
+        :param max_epochs: the max epochs
+        :return: the loss terms of current epoch
+        """
+        for epoch in range(start_epoch, max_epochs):
+            s_time = time.time()
+            _, train_loss, _ = self.iter(epoch, train=True)
+            t_time = time.time() - s_time
+            if self.gpu_id == 0:
+                print(f"epoch={epoch:04d}, cur_lr={self.scheduler.get_lr()[0]:.5f}, train_loss={train_loss:.6f}, train_time={t_time:.2f}", flush=True)
+
+    def validation(self, max_val_batches: int) -> float:
+        """
+        The validation iteration
+        :param max_val_batches: the maximum number of batches to validate
+        :return: the average validation loss
+        """
+        self.model.eval()
+        loss_sum = 0
+        n_batches = 0
+        recon_loss_sum = 0
+        cmim_loss_sum = 0
+        log_p_k1_sum = 0
+        log_q_z_sum = 0
+        log_P_z_sum = 0
+        recon_accuracy_sum = 0
+
+        for ibatch, item in enumerate(self.val_dataloader):
+            # Forward pass - pass whole batch to model
+            preds = self.model(item)
+            
+            # CMIM+Reconstruction loss returns: (overall_loss, recon_loss, cmim_loss, log_p_k1, log_q_z, log_P_z, recon_accuracy)
+            # Note: recon_accuracy will be None if args.tensorboard is False
+            loss, recon_loss, cmim_loss, log_p_k1, log_q_z, log_P_z, recon_accuracy = self.loss_func(preds, targets=None)
+
+            loss_sum += loss.item()
+            recon_loss_sum += recon_loss.item()
+            cmim_loss_sum += cmim_loss.item()
+            log_p_k1_sum += log_p_k1.item()
+            log_q_z_sum += log_q_z.item()
+            log_P_z_sum += log_P_z.item()
+            if self.args.tensorboard:
+                recon_accuracy_sum += recon_accuracy.item()
+
+            n_batches += 1
+            if n_batches >= max_val_batches:
+                break
+
+        # Compute per batch losses
+        loss_sum /= n_batches
+        recon_loss_sum /= n_batches
+        cmim_loss_sum /= n_batches
+        log_p_k1_sum /= n_batches
+        log_q_z_sum /= n_batches
+        log_P_z_sum /= n_batches
+        if self.args.tensorboard:
+            recon_accuracy_sum /= n_batches
+
+        if self.gpu_id == 0:
+            # Print with accuracy only if TensorBoard is enabled
+            if self.args.tensorboard:
+                print(f"Validation loss: {loss_sum:.4f}, recon_loss: {recon_loss_sum:.4f}, cmim_loss: {cmim_loss_sum:.4f}, "
+                      f"log_p_k1: {log_p_k1_sum:.4f}, log_q_z: {log_q_z_sum:.4f}, log_P_z: {log_P_z_sum:.4f}, "
+                      f"recon_acc: {recon_accuracy_sum:.4f}", flush=True)
+            else:
+                print(f"Validation loss: {loss_sum:.4f}, recon_loss: {recon_loss_sum:.4f}, cmim_loss: {cmim_loss_sum:.4f}, "
+                      f"log_p_k1: {log_p_k1_sum:.4f}, log_q_z: {log_q_z_sum:.4f}, log_P_z: {log_P_z_sum:.4f}", flush=True)
+            
+            if self.args.tensorboard:
+                self.writer.add_scalar('val/loss', loss_sum, self.n_steps)
+                self.writer.add_scalar('val/recon_loss', recon_loss_sum, self.n_steps)
+                self.writer.add_scalar('val/cmim_loss', cmim_loss_sum, self.n_steps)
+                self.writer.add_scalar('val/log_p_k1_given_zx', log_p_k1_sum, self.n_steps)
+                self.writer.add_scalar('val/log_q_z_given_x', log_q_z_sum, self.n_steps)
+                self.writer.add_scalar('val/log_P_z', log_P_z_sum, self.n_steps)
+                self.writer.add_scalar('val/recon_accuracy', recon_accuracy_sum, self.n_steps)
+
+        self.model.train()
+        return loss_sum
+
+    def set_batch_idx(self, batch_idx: int):
+        self.curr_epoch_batch_idx = batch_idx
+
+    def iter(self, epoch, train=True) -> List:
+        """
+        Perform a training / validation iteration.
+        :param epoch: the current epoch number
+        :param train: True: train model, False: validation model
+        :return: the loss terms as a list
+        """
+        if train:
+            self.model.train()
+            self.train_dataloader.sampler.set_epoch(epoch)
+        else:
+            self.model.eval()
+
+        loss_sum, iter_count = 0, 0
+        cum_loss_sum, cum_iter_count = 0, 0
+        recon_loss_sum = 0
+        cmim_loss_sum = 0
+        log_p_k1_sum = 0
+        log_q_z_sum = 0
+        log_P_z_sum = 0
+        recon_accuracy_sum = 0
+
+        for ibatch, item in enumerate(self.train_dataloader):
+            if self.first_epoch_post_resume:
+                if ibatch < self.curr_epoch_batch_idx:
+                    print(f"Skipping batch {ibatch} because of curr_epoch_batch_idx={self.curr_epoch_batch_idx}", flush=True)
+                    continue
+                elif ibatch >= self.curr_epoch_batch_idx:
+                    print(f"Stop skipping batches because of curr_epoch_batch_idx={self.curr_epoch_batch_idx}", flush=True)
+                    self.first_epoch_post_resume = False
+
+            if self.gpu_id == 0:
+                print(f"{self.n_steps=}", flush=True)
+            
+            # Forward pass - pass whole batch to model
+            preds = self.model(item)
+
+            # CMIM+Reconstruction loss returns: (overall_loss, recon_loss, cmim_loss, log_p_k1, log_q_z, log_P_z, recon_accuracy)
+            # Note: recon_accuracy will be None if args.tensorboard is False
+            loss, recon_loss, cmim_loss, log_p_k1, log_q_z, log_P_z, recon_accuracy = self.loss_func(preds, targets=None)
+
+            loss_sum += loss.item()
+            iter_count += self.args.batch_size
+
+            if train:
+                cum_loss_sum += loss.item()
+                # Run model
+                self.model.zero_grad()
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                self.scheduler.step()
+            else:
+                cum_loss_sum += loss.item()
+
+            recon_loss_sum += recon_loss.item()
+            cmim_loss_sum += cmim_loss.item()
+            log_p_k1_sum += log_p_k1.item()
+            log_q_z_sum += log_q_z.item()
+            log_P_z_sum += log_P_z.item()
+            if self.args.tensorboard:
+                recon_accuracy_sum += recon_accuracy.item()
+
+            # Save model
+            if (self.gpu_id == 0) and (self.n_steps % self.args.save_interval) == 0:
+                self.save(batch_idx=ibatch, n_steps=self.n_steps, epoch=epoch, 
+                         file_path=self.args.save_dir, name=f"model_step_{self.n_steps}.pt", save_last=True)
+
+            cum_iter_count += 1
+            self.n_iter += self.args.batch_size
+            self.n_steps += 1
+
+            if self.gpu_id == 0 and self.args.tensorboard and self.n_steps % 10 == 0:
+                self.writer.add_scalar('train/loss', loss.item(), self.n_steps)
+                self.writer.add_scalar('train/recon_loss', recon_loss.item(), self.n_steps)
+                self.writer.add_scalar('train/cmim_loss', cmim_loss.item(), self.n_steps)
+                self.writer.add_scalar('train/log_p_k1_given_zx', log_p_k1.item(), self.n_steps)
+                self.writer.add_scalar('train/log_q_z_given_x', log_q_z.item(), self.n_steps)
+                self.writer.add_scalar('train/log_P_z', log_P_z.item(), self.n_steps)
+                self.writer.add_scalar('train/recon_accuracy', recon_accuracy.item(), self.n_steps)
+                self.writer.add_scalar('train/lr', self.scheduler.get_lr()[0], self.n_steps)
+                self.writer.add_scalar('train/epoch', epoch, self.n_steps)
+                self.writer.add_scalar('train/batch_idx', ibatch, self.n_steps)
+
+        cum_loss_sum /= cum_iter_count
+        cmim_loss_sum /= cum_iter_count
+        log_p_k1_sum /= cum_iter_count
+        log_q_z_sum /= cum_iter_count
+        log_P_z_sum /= cum_iter_count
+        if self.args.tensorboard:
+            recon_accuracy_sum /= cum_iter_count
+
+        val_loss = self.validation(max_val_batches=self.args.max_val_batches)
+
+        return self.n_iter, cum_loss_sum, (cmim_loss_sum, log_p_k1_sum, log_q_z_sum, log_P_z_sum)
+
+    def save(self, batch_idx, n_steps, epoch, file_path, name=None, save_last=False) -> str:
+        """
+        Save the intermediate models during training.
+        :param batch_idx: the batch index
+        :param n_steps: the step number
+        :param epoch: the epoch number
+        :param file_path: the file_path to save the model
+        :param name: optional custom filename
+        :param save_last: whether to save the last model
+        :return: the output path
+        """
+        return save_checkpoint(self.model, self.optimizer, self.args, batch_idx, 
+                              n_steps, epoch, file_path, name, save_last)
+
+    def load(self, checkpoint_path) -> Tuple[int, int, int]:
+        """
+        Load checkpoint for CMIM training.
+        :param checkpoint_path: path to checkpoint file
+        :return: tuple of (epoch, scheduler_step, batch_idx)
+        """
+        epoch, scheduler_step, batch_idx = load_checkpoint(
+            checkpoint_path, self.model, self.optimizer, self.scheduler
+        )
         self.n_steps = scheduler_step
         return epoch, scheduler_step, batch_idx
     

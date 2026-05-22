@@ -38,7 +38,7 @@
 The parsing functions for the argument input.
 """
 import os
-import json
+import pickle
 from argparse import ArgumentParser, Namespace
 from tempfile import TemporaryDirectory
 
@@ -260,9 +260,7 @@ def add_finetune_args(parser: ArgumentParser):
     parser.add_argument('--ffn_num_layers', type=int, default=2,
                         help='Number of layers in FFN after MPN encoding')
     parser.add_argument('--ffn_task_specific_hidden_size', type=int, default=None,
-                        help='Hidden size for task-specific FFN layers (and common FFN '
-                             'output when task-specific layers are used). Required if '
-                             'ffn_num_task_specific_layers > 0.')
+                        help='Number of task-specific layers in FFN after common FFN layer encoding')
     parser.add_argument('--ffn_num_task_specific_layers', type=int, default=0,
                         help='Number of task-specific layers in FFN after common FFN layer encoding')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='weight_decay')
@@ -302,85 +300,152 @@ def add_finetune_args(parser: ArgumentParser):
 
 
 def add_pretrain_args(parser: ArgumentParser):
+    """
+    Add arguments for pretraining with organized parameter groups.
+    Supports both vocabulary-based pretraining and CMIM pretraining with decoder.
+    """
+    
+    # ========== System and Hardware Arguments ==========
     parser.add_argument('--cuda', type=bool, default=True,
-                        help='Enable gpu traning or not.')
+                        help='Enable gpu training or not.')
     parser.add_argument('--enable_multi_gpu', dest='enable_multi_gpu',
                         action='store_true', default=False,
-                        help='enable multi-GPU training')
-
-    # Data arguments
+                        help='Enable multi-GPU training')
+    parser.add_argument("--seed", type=int, default=0, 
+                        help="Random seed for pretraining.")
+    
+    # ========== Data Arguments ==========
     parser.add_argument('--train_data_path', type=str, required=True,
                         help='Path to train data CSV file')
     parser.add_argument('--val_data_path', type=str, required=False,
                         help='Path to val data CSV file')
     parser.add_argument('--test_data_path', type=str, required=False, default=None,
                         help='Path to test data CSV file')
-    parser.add_argument('--fg_label_path', type=str, nargs='*',
-                        help='Path to the label of fg task.')
-    parser.add_argument('--atom_vocab_path', type=str, help="Path to the vocabulary.")
-    parser.add_argument('--bond_vocab_path', type=str,
-                        help="Path to the bond vocabulary.")
     
-    # Featurization arguments
+    # Vocabulary paths (mode-dependent)
+    parser.add_argument('--atom_vocab_path', type=str, required=False, default=None,
+                        help="Path to atom vocabulary (required for vocab-based pretraining).")
+    parser.add_argument('--bond_vocab_path', type=str, required=False, default=None,
+                        help="Path to bond vocabulary (required for vocab-based pretraining).")
+    parser.add_argument('--smiles_vocab_path', type=str, required=False, default=None,
+                        help="Path to SMILES vocabulary (required for CMIM/decoder training).")
+    parser.add_argument('--fg_label_path', type=str, nargs='*',
+                        help='Path to functional group task labels (optional).')
+    
+    # Featurization
     parser.add_argument('--use_cuikmolmaker_featurization', action='store_true', default=False,
-                        help='Use cuik-molmaker package for featurization of molecules')
-
-    # Model arguments
+                        help='Use cuik-molmaker package for molecule featurization')
+    
+    # ========== Training Mode Selection ==========
+    parser.add_argument('--use_cmim', action='store_true', default=False,
+                        help='Use CMIM (Contrastive Mutual Information Maximization) pretraining. '
+                             'Default: False (uses vocabulary-based pretraining).')
+    
+    # ========== Encoder Model Arguments ==========
+    parser.add_argument("--backbone", default="gtrans", choices=["gtrans"],
+                        help="Encoder backbone architecture.")
     parser.add_argument('--embedding_output_type', type=str, default='both', nargs='?',
                         choices=("atom", "bond", "both"),
-                        help="Type of output embeddings. Options: atom, bond, both")
-
-    #parser.add_argument('--source_branch', type=str, default='both', nargs='?', choices=("atom", "bond", "both"),
-    #                    help="Type of source branch in gtrans. Options: atom, bond, both")
-
-    parser.add_argument('--save_dir', type=str, default=None,
-                        help='Directory where model checkpoints will be saved')
-    parser.add_argument('--save_interval', type=int, default=100, help='The model saving interval (in steps).')
+                        help="Type of output embeddings from encoder. Options: atom, bond, both")
     parser.add_argument('--hidden_size', type=float, default=3,
-                        help='Dimensionality of hidden layers. The actual dimension is hidden_size * 100.')
-    parser.add_argument('--bias', action='store_true', default=False,
-                        help='Whether to add bias to linear layers')
+                        help='Encoder hidden dimension (actual dimension = hidden_size * 100). '
+                             'Default: 3 (→ 300).')
     parser.add_argument('--depth', type=int, default=3,
-                        help='Number of message passing steps')
+                        help='Number of encoder message passing layers.')
+    parser.add_argument('--num_attn_head', type=int, default=4, 
+                        help='Number of attention heads in encoder MTBlock.')
+    parser.add_argument('--num_mt_block', type=int, default=1, 
+                        help="Number of MTBlocks in encoder.")
     parser.add_argument('--dropout', type=float, default=0.0,
-                        help='Dropout probability')
+                        help='Dropout probability for encoder.')
     parser.add_argument('--activation', type=str, default='PReLU',
                         choices=['ReLU', 'LeakyReLU', 'PReLU', 'tanh', 'SELU', 'ELU'],
-                        help='Activation function')
+                        help='Activation function for encoder.')
+    parser.add_argument('--bias', action='store_true', default=False,
+                        help='Whether to add bias to encoder linear layers')
     parser.add_argument('--undirected', action='store_true', default=False,
-                        help='Undirected edges (always sum the two relevant bond vectors)')
-    parser.add_argument('--weight_decay', type=float, default=0.0, help='weight_decay')
-    parser.add_argument('--num_attn_head', type=int, default=4, help='The attention head in MTBlock.')
-    parser.add_argument('--num_mt_block', type=int, default=1, help="The number of MTBlock.")
-    parser.add_argument('--dist_coff', type=float, default=0.1, help='The disagreement coefficient for '
-                                                                     'the atom and bond branch.')
-
-
-    # Training arguments
-    parser.add_argument("--backbone", default="gtrans", choices=["gtrans"])
+                        help='Use undirected edges (sum the two relevant bond vectors)')
+    parser.add_argument('--bond_drop_rate', type=float, default=0, 
+                        help='Dropout rate for bonds in molecular graph')
+    parser.add_argument('--dist_coff', type=float, default=0.1, 
+                        help='Disagreement coefficient for atom and bond branches.')
+    
+    # Readout layer (for molecule-level embedding)
+    parser.add_argument('--self_attention', action='store_true', default=False,
+                        help='Use self-attention readout layer. '
+                             'Default: False (uses mean aggregation).')
+    parser.add_argument('--attn_hidden', type=int, default=4,
+                        help='Self-attention readout hidden layer size.')
+    parser.add_argument('--attn_out', type=int, default=128,
+                        help='Self-attention readout output feature size.')
+    
+    # ========== CMIM-Specific Arguments ==========
+    parser.add_argument('--latent_dim', type=int, default=512,
+                        help='Dimension of latent space for CMIM. This also determines decoder hidden size '
+                             '(latent_dim must equal decoder hidden_size for cross-attention). '
+                             'Default: 512.')
+    parser.add_argument('--contrastive_temperature', type=float, default=0.1,
+                        help='Temperature parameter for contrastive loss in CMIM. '
+                             'Default: 0.1')
+    parser.add_argument('--reconstruction_loss_weight', type=float, default=1.0,
+                        help='Weight for SMILES reconstruction loss in CMIM training. '
+                             'Default: 1.0')
+    parser.add_argument('--normalize_gradient', action='store_true', default=False,
+                        help='Normalize gradients of CMIM loss components (log_q_z_given_x, log_P_z) by latent dimensionality. '
+                             'Useful when latent_dim is large and dominates gradient magnitudes. '
+                             'Default: False')
+    parser.add_argument('--normalize_loss', action='store_true', default=False,
+                        help='Normalize CMIM loss values by latent dimensionality. '
+                             'Scales the loss values themselves (affects what gets logged). '
+                             'Can be used independently or together with --normalize_gradient. '
+                             'Default: False')
+    
+    # ========== Decoder Model Arguments (for CMIM with reconstruction) ==========
+    parser.add_argument('--decoder_num_layers', type=int, default=3,
+                        help='Number of transformer decoder layers. Default: 3')
+    parser.add_argument('--decoder_num_attention_heads', type=int, default=8,
+                        help='Number of attention heads in decoder. Default: 8')
+    parser.add_argument('--decoder_ffn_hidden_size', type=int, default=2048,
+                        help='Decoder feedforward hidden size. '
+                             'Default: 2048 (4 * latent_dim with latent_dim=512).')
+    parser.add_argument('--decoder_dropout', type=float, default=0.1,
+                        help='Dropout probability for decoder. Default: 0.1')
+    parser.add_argument('--decoder_max_seq_len', type=int, default=512,
+                        help='Maximum SMILES sequence length for decoder (sequences will be truncated). '
+                             'Default: 512. Increase if you have longer SMILES.')
+    parser.add_argument('--decoder_positional_encoding', type=str, default='rope',
+                        choices=['rope', 'sinusoidal'],
+                        help='Type of positional encoding for decoder. '
+                             'Options: "rope" (Rotary Position Embedding) or "sinusoidal" (classic additive). '
+                             'Default: rope')
+    
+    # ========== Training Arguments ==========
     parser.add_argument('--epochs', type=int, default=30,
-                        help='Number of epochs to run')
+                        help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size per GPU (micro batch size)')
-    parser.add_argument('--max_val_batches', type=int, default=10,
-                        help='Maximum number of batches to in validation loop.')
     parser.add_argument('--num_dataloader_workers', type=int, default=0,
                         help='Number of workers for dataloader')
     parser.add_argument('--warmup_epochs', type=float, default=2.0,
-                        help='Number of epochs during which learning rate increases linearly from'
-                             'init_lr to max_lr. Afterwards, learning rate decreases exponentially'
-                             'from max_lr to final_lr.')
+                        help='Number of warmup epochs for learning rate schedule')
     parser.add_argument('--init_lr', type=float, default=1e-4,
                         help='Initial learning rate')
     parser.add_argument('--max_lr', type=float, default=1e-3,
                         help='Maximum learning rate')
     parser.add_argument('--final_lr', type=float, default=1e-4,
                         help='Final learning rate')
-    parser.add_argument('--bond_drop_rate', type=float, default=0, help='Drop out bond in molecular')
-
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for pretraining.")
-
-    parser.add_argument("--tensorboard", action="store_true", default=False, help="Use tensorboard to visualize training.")
+    parser.add_argument('--weight_decay', type=float, default=0.0, 
+                        help='Weight decay for optimizer')
+    parser.add_argument('--max_val_batches', type=int, default=10,
+                        help='Maximum number of batches in validation loop.')
+    
+    # ========== Checkpoint and Logging Arguments ==========
+    parser.add_argument('--save_dir', type=str, default=None,
+                        help='Directory where model checkpoints will be saved')
+    parser.add_argument('--save_interval', type=int, default=100, 
+                        help='Model saving interval (in steps).')
+    parser.add_argument("--tensorboard", action="store_true", default=False, 
+                        help="Use tensorboard to visualize training.")
 
 def update_checkpoint_args(args: Namespace):
     """
@@ -521,8 +586,8 @@ def modify_train_args(args: Namespace):
     assert (args.split_type == 'crossval') == (args.crossval_index_dir is not None)
     assert (args.split_type in ['crossval', 'index_predetermined']) == (args.crossval_index_file is not None)
     if args.split_type in ['crossval', 'index_predetermined']:
-        with open(args.crossval_index_file, 'r') as rf:
-            args.crossval_index_sets = json.load(rf)
+        with open(args.crossval_index_file, 'rb') as rf:
+            args.crossval_index_sets = pickle.load(rf)
         args.num_folds = len(args.crossval_index_sets)
         args.seed = 0
 

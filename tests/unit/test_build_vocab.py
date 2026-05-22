@@ -27,7 +27,7 @@ import pytest
 from scripts.build_vocab import build
 from argparse import Namespace
 import os
-from kermt.data.torchvocab import TorchVocab
+import pickle as pkl
 
 def test_build_vocab(data_dir):
     data_path = data_dir / "smis_only.csv"
@@ -41,11 +41,11 @@ def test_build_vocab(data_dir):
     )
     build(args)
 
-    atom_vocab = TorchVocab.load_vocab(os.path.join(save_dir, "test_build_vocab_atom_vocab.json"))
-    bond_vocab = TorchVocab.load_vocab(os.path.join(save_dir, "test_build_vocab_bond_vocab.json"))
+    atom_vocab = pkl.load(open(os.path.join(save_dir, "test_build_vocab_atom_vocab.pkl"), "rb"))
+    bond_vocab = pkl.load(open(os.path.join(save_dir, "test_build_vocab_bond_vocab.pkl"), "rb"))
 
-    atom_vocab_ref = TorchVocab.load_vocab(str(data_dir / "test_build_vocab_atom_vocab.json"))
-    bond_vocab_ref = TorchVocab.load_vocab(str(data_dir / "test_build_vocab_bond_vocab.json"))
+    atom_vocab_ref = pkl.load(open(data_dir / "test_build_vocab_atom_vocab.pkl", "rb"))
+    bond_vocab_ref = pkl.load(open(data_dir / "test_build_vocab_bond_vocab.pkl", "rb"))
 
     assert len(atom_vocab) == len(atom_vocab_ref), f"Atom vocab size mismatch: {len(atom_vocab)} != {len(atom_vocab_ref)}"
     assert len(bond_vocab) == len(bond_vocab_ref), f"Bond vocab size mismatch: {len(bond_vocab)} != {len(bond_vocab_ref)}"
@@ -54,7 +54,7 @@ def test_build_vocab(data_dir):
     assert bond_vocab.stoi.keys() == bond_vocab_ref.stoi.keys(), f"Bond vocab keys mismatch: {bond_vocab.stoi.keys()} != {bond_vocab_ref.stoi.keys()}"
 
     # Clean up generated vocab files after test
-    if os.path.exists(os.path.join(save_dir, "test_build_vocab_atom_vocab.json")):
-        os.remove(os.path.join(save_dir, "test_build_vocab_atom_vocab.json"))
-    if os.path.exists(os.path.join(save_dir, "test_build_vocab_bond_vocab.json")):
-        os.remove(os.path.join(save_dir, "test_build_vocab_bond_vocab.json"))
+    if os.path.exists(os.path.join(save_dir, "test_build_vocab_atom_vocab.pkl")):
+        os.remove(os.path.join(save_dir, "test_build_vocab_atom_vocab.pkl"))
+    if os.path.exists(os.path.join(save_dir, "test_build_vocab_bond_vocab.pkl")):
+        os.remove(os.path.join(save_dir, "test_build_vocab_bond_vocab.pkl"))

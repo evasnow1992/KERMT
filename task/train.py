@@ -40,7 +40,7 @@ The training function used in the finetuning task.
 import csv
 import logging
 import os
-import json
+import pickle
 import time
 from argparse import Namespace
 from logging import Logger
@@ -406,7 +406,7 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
                 for task_name, ensemble_score in zip(args.task_names, ensemble_scores):
                     info(f'Ensemble test {task_name} {args.metric} = {ensemble_score:.6f}')
 
-            # Log to wandb if enabled
+# Log to wandb if enabled
             if args.wandb_project:
                 for task_name, ensemble_score in zip(args.task_names, ensemble_scores):
                     wandb.summary[f"test/{task_name}_{args.metric}"] = ensemble_score
@@ -539,6 +539,6 @@ def save_splits(args, test_data, train_data, val_data):
             split_indices.append(indices_by_smiles[smiles])
             split_indices = sorted(split_indices)
         all_split_indices.append(split_indices)
-    with open(os.path.join(args.save_dir, 'split_indices.json'), 'w') as f:
-        json.dump(all_split_indices, f)
+    with open(os.path.join(args.save_dir, 'split_indices.pckl'), 'wb') as f:
+        pickle.dump(all_split_indices, f)
     return writer

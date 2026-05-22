@@ -32,11 +32,12 @@ from torch.distributed import init_process_group, destroy_process_group
 import os
 
 
-from kermt.data.kermtdataset import get_data, split_data, KermtCollator
+from kermt.data.kermtdataset import get_data, split_data, KermtCollator, KermtDecoderCollator
 from kermt.util.utils import create_logger
 from kermt.model.models import KERMTEmbedding
-from task.kermttrainer import KERMTTrainer
-from kermt.data.torchvocab import MolVocab
+from task.kermttrainer import KERMTTrainer, KERMTCMIMTrainer
+from kermt.util.scheduler import NoamLR
+from kermt.data.torchvocab import MolVocab, SMILESVocab
 from kermt.data.kermtdataset import BatchMolDataset
 from kermt.util.parsing import parse_args_ddp
 from kermt.util.nn_utils import param_count_trainable, param_count_total
@@ -127,10 +128,6 @@ def main(rank: int, world_size: int):
     else:
         test_data = None
         test_data_size = 0
-    # load atom and bond vocabulary and the semantic motif labels.
-    atom_vocab = MolVocab.load_vocab(args.atom_vocab_path)
-    bond_vocab = MolVocab.load_vocab(args.bond_vocab_path)
-    atom_vocab_size, bond_vocab_size = len(atom_vocab), len(bond_vocab)
 
     train_sampler = DistributedSampler(
             train_data, num_replicas=world_size, rank=rank, shuffle=True)
@@ -147,11 +144,50 @@ def main(rank: int, world_size: int):
     else:
         test_sampler = None
 
-    # build collator
-    # Hard coding here, since we haven't load any data yet!
-    fg_size = 85
+    # Build collator based on training mode
     shared_dict = {}
-    mol_collator = KermtCollator(shared_dict=shared_dict, atom_vocab=atom_vocab, bond_vocab=bond_vocab, args=args)
+    
+    if args.use_cmim:
+        # CMIM mode - only needs SMILES vocabulary
+        if args.smiles_vocab_path is None:
+            raise ValueError(
+                "CMIM training (--use_cmim) requires --smiles_vocab_path\n"
+                "Example: --smiles_vocab_path path/to/pretrain_smiles_vocab.pkl"
+            )
+        if rank == 0:
+            print("[INFO] CMIM mode: Loading SMILES vocabulary")
+        smiles_vocab = SMILESVocab.load_vocab(args.smiles_vocab_path)
+        smiles_vocab_size = len(smiles_vocab)
+        if rank == 0:
+            print(f"[INFO] SMILES vocabulary size: {smiles_vocab_size}")
+        # CMIM training - use KermtDecoderCollator
+        mol_collator = KermtDecoderCollator(
+            shared_dict=shared_dict,
+            smiles_vocab=smiles_vocab,
+            args=args
+        )
+    else:
+        # Vocab-based pretraining mode - only needs atom and bond vocabularies
+        if args.atom_vocab_path is None or args.bond_vocab_path is None:
+            raise ValueError(
+                "Vocab-based pretraining requires --atom_vocab_path and --bond_vocab_path\n"
+                "Example: --atom_vocab_path path/to/pretrain_atom_vocab.pkl "
+                "--bond_vocab_path path/to/pretrain_bond_vocab.pkl"
+            )
+        if rank == 0:
+            print("[INFO] Vocab-based mode: Loading atom and bond vocabularies")
+        atom_vocab = MolVocab.load_vocab(args.atom_vocab_path)
+        bond_vocab = MolVocab.load_vocab(args.bond_vocab_path)
+        atom_vocab_size, bond_vocab_size = len(atom_vocab), len(bond_vocab)
+        if rank == 0:
+            print(f"[INFO] Atom vocabulary size: {atom_vocab_size}, Bond vocabulary size: {bond_vocab_size}")
+        # Vocab-based pretraining - use KermtCollator
+        mol_collator = KermtCollator(
+            shared_dict=shared_dict,
+            atom_vocab=atom_vocab,
+            bond_vocab=bond_vocab,
+            args=args
+        )
 
     train_dataloader = DataLoader(train_data, batch_size=args.batch_size, # batch size per GPU (aka micro batch size)
                                   shuffle=False, # because train_sampler does the shuffling
@@ -170,25 +206,84 @@ def main(rank: int, world_size: int):
     else:
         val_dataloader = None
         
-    # Build model
-    kermt_model = KERMTEmbedding(args)
+    # Build model - create complete task model based on training mode
+    # This ensures all model parameters (encoder, decoder, heads) are included
+    kermt_embedding = KERMTEmbedding(args)
+    
+    if args.use_cmim:
+        # Build complete CMIM task model (encoder + latent distribution + decoder)
+        if rank == 0:
+            print("[INFO] Building KermtCMIMTask model")
+        from kermt.model.models import KermtCMIMTask
+        model = KermtCMIMTask(
+            args,
+            kermt=kermt_embedding,
+            latent_dim=args.latent_dim,
+            contrastive_temperature=args.contrastive_temperature,
+            smiles_vocab_size=smiles_vocab_size
+        )
+    else:
+        # Build complete vocab task model (encoder + vocab prediction heads)
+        if rank == 0:
+            print("[INFO] Building KermtTask model")
+        from kermt.model.models import KermtTask
+        fg_size = 85
+        model = KermtTask(
+            args,
+            kermt=kermt_embedding,
+            atom_vocab_size=atom_vocab_size,
+            bond_vocab_size=bond_vocab_size,
+            fg_size=fg_size
+        )
+    
+    print(f'Number of trainable parameters = {param_count_trainable(model):,}')
+    print(f'Number of total parameters = {param_count_total(model):,}')
 
-    print(f'Number of trainable parameters = {param_count_trainable(kermt_model):,}')
-    print(f'Number of total parameters = {param_count_total(kermt_model):,}')
+    # Build optimizer on COMPLETE model (includes all trainable components)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.init_lr, weight_decay=args.weight_decay)
 
-    # Build trainer
-    trainer = KERMTTrainer(args=args,
-                            embedding_model=kermt_model,
-                            atom_vocab_size=atom_vocab_size,
-                            bond_vocab_size=bond_vocab_size,
-                            fg_szie=fg_size,
-                            train_dataloader=train_dataloader,
-                            val_dataloader=val_dataloader,
-                            world_size=world_size,
-                            gpu_id=rank,
-                            n_steps=0,
-                            logger=logger
-                            )
+    # Build Learning rate scheduler   
+    steps_per_epoch = train_data_size // (args.batch_size*world_size)
+    scheduler = NoamLR(
+        optimizer=optimizer,
+        warmup_epochs=args.warmup_epochs,
+        total_epochs=args.epochs,
+        steps_per_epoch=steps_per_epoch,
+        init_lr=args.init_lr,
+        max_lr=args.max_lr,
+        final_lr=args.final_lr,
+        fine_tune_coff=args.fine_tune_coff
+    )
+ 
+    # Build trainer - pass the complete model
+    if args.use_cmim:
+        if rank == 0:
+            print("[INFO] Initializing KERMTCMIMTrainer")
+        trainer = KERMTCMIMTrainer(
+            args=args,
+            model=model,
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            gpu_id=rank,
+            n_steps=0,
+            logger=logger
+        )
+    else:
+        if rank == 0:
+            print("[INFO] Initializing KERMTTrainer (vocab-based pretraining)")
+        trainer = KERMTTrainer(
+            args=args,
+            model=model,
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            gpu_id=rank,
+            n_steps=0,
+            logger=logger
+        )
 
     if args.save_dir is not None:
         last_ckpt_path = os.path.join(args.save_dir, "last_checkpoint.pt")

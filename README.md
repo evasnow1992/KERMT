@@ -66,7 +66,7 @@ python scripts/build_vocab.py --data_path tests/data/smis_only.csv  \
                               --vocab_save_folder tests/data/smis_only  \
                               --dataset_name smis_only
  ```
-The outputs of this script are vocabulary dicts of atoms and bonds, `smis_only_atom_vocab.json` and `smis_only_bond_vocab.json`, respectively. For more options for contextual property extraction, please refer to `scripts/build_vocab.py`.
+The outputs of this script are vocabulary dicts of atoms and bonds, `smis_only_atom_vocab.pkl` and `smis_only_bond_vocab.pkl`, respectively. For more options for contextual property extraction, please refer to `scripts/build_vocab.py`.
 
 #### Data Splitting
 Split pretraining data and features into smaller files for memory efficiency.
@@ -93,8 +93,8 @@ WORLD_SIZE=2 python pretrain_ddp.py  \
     --train_data_path tests/data/smis_only/train_9k \
     --val_data_path tests/data/smis_only/val_1k \
     --save_dir model/pretrain \
-    --atom_vocab_path tests/data/smis_only/smis_only_atom_vocab.json \
-    --bond_vocab_path tests/data/smis_only/smis_only_bond_vocab.json \
+    --atom_vocab_path tests/data/smis_only/smis_only_atom_vocab.pkl \
+    --bond_vocab_path tests/data/smis_only/smis_only_bond_vocab.pkl \
     --batch_size 256   --dropout 0.1 --depth 6 --num_attn_head 4 --hidden_size 800 \
     --epochs 100 --init_lr 1E-5 --max_lr 1.5E-4 --final_lr 1E-5 --warmup_epochs 20 \
     --weight_decay 1E-7 --activation PReLU --backbone gtrans --embedding_output_type \

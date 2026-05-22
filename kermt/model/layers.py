@@ -667,7 +667,7 @@ class GTransEncoder(nn.Module):
                  activation="ReLU",
                  num_mt_block=1,
                  num_attn_head=4,
-                 atom_emb_output: Union[bool, str] = False,  # options: True, False, None, "atom", "bond", "both"
+                 embedding_output_type: Union[str, None] = None,
                  bias=False,
                  cuda=True,
                  res_connection=False):
@@ -681,26 +681,18 @@ class GTransEncoder(nn.Module):
         :param activation: the activation function
         :param num_mt_block: the number of mt block.
         :param num_attn_head: the number of attention head.
-        :param atom_emb_output:  enable the output aggregation after message passing.
-                                              atom_messages:      True                      False
-        -False: no aggregating to atom. output size:     (num_atoms, hidden_size)    (num_bonds, hidden_size)
-        -True:  aggregating to atom.    output size:     (num_atoms, hidden_size)    (num_atoms, hidden_size)
-        -None:                         same as False
-        -"atom":                       same as True
-        -"bond": aggragating to bond.   output size:     (num_bonds, hidden_size)    (num_bonds, hidden_size)
-        -"both": aggregating to atom&bond. output size:  (num_atoms, hidden_size)    (num_bonds, hidden_size)
-                                                         (num_bonds, hidden_size)    (num_atoms, hidden_size)
+        :param embedding_output_type: Controls the output aggregation after message passing.
+                                              atom_messages:      atom                        bond
+        - None:  no aggregating to atom. output size:     (num_atoms, hidden_size)    (num_bonds, hidden_size)
+        - "atom": aggregating to atom.   output size:     (num_atoms, hidden_size)    (num_atoms, hidden_size)
+        - "bond": aggregating to bond.   output size:     (num_bonds, hidden_size)    (num_bonds, hidden_size)
+        - "both": aggregating to both.   output size:     (num_atoms, hidden_size)    (num_bonds, hidden_size)
+                                                          (num_bonds, hidden_size)    (num_atoms, hidden_size)
         :param bias: enable bias term in all linear layers.
         :param cuda: run with cuda.
         :param res_connection: enables the skip-connection in MTBlock.
         """
         super(GTransEncoder, self).__init__()
-
-        # For the compatibility issue.
-        if atom_emb_output is False:
-            atom_emb_output = None
-        if atom_emb_output is True:
-            atom_emb_output = 'atom'
 
         self.hidden_size = hidden_size
         self.dropout = dropout
@@ -739,7 +731,7 @@ class GTransEncoder(nn.Module):
                                             atom_messages=True,
                                             cuda=cuda))
 
-        self.atom_emb_output = atom_emb_output
+        self.embedding_output_type = embedding_output_type
 
         self.ffn_atom_from_atom = PositionwiseFeedForward(self.hidden_size + node_fdim,
                                                           self.hidden_size * 4,
@@ -889,11 +881,11 @@ class GTransEncoder(nn.Module):
         atom_output, _, _, _, _, _, _, _ = node_batch  # atom hidden states
         _, bond_output, _, _, _, _, _, _ = edge_batch  # bond hidden states
 
-        if self.atom_emb_output is None:
+        if self.embedding_output_type is None:
             # output the embedding from multi-head attention directly.
             return atom_output, bond_output
 
-        if self.atom_emb_output == 'atom':
+        if self.embedding_output_type == 'atom':
             return self.atom_bond_transform(to_atom=True,  # False: to bond
                                             atomwise_input=atom_output,
                                             bondwise_input=bond_output,
@@ -903,7 +895,7 @@ class GTransEncoder(nn.Module):
                                             a2b=a2b,
                                             b2a=b2a,
                                             b2revb=b2revb)
-        elif self.atom_emb_output == 'bond':
+        elif self.embedding_output_type == 'bond':
             return self.atom_bond_transform(to_atom=False,  # False: to bond
                                             atomwise_input=atom_output,
                                             bondwise_input=bond_output,
@@ -936,3 +928,295 @@ class GTransEncoder(nn.Module):
             # Notice: need to be consistent with output format of DualMPNN encoder
             return ((atom_embeddings[0], bond_embeddings[0]),
                     (atom_embeddings[1], bond_embeddings[1]))
+
+class PositionalEncoding(nn.Module):
+    """
+    Classic sinusoidal positional encoding for transformer decoder.
+    Adds positional information to token embeddings using sine and cosine functions.
+    """
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 512):
+        """
+        :param d_model: embedding dimension
+        :param dropout: dropout rate
+        :param max_len: maximum sequence length
+        """
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        # Create positional encoding matrix
+        position = torch.arange(max_len).unsqueeze(1)  # [max_len, 1]
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)  # [max_len, 1, d_model]
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        :param x: input tensor [batch_size, seq_len, d_model] (batch_first format)
+        :return: positional encoded tensor with same shape
+        """
+        # x: [batch_size, seq_len, d_model]
+        seq_len = x.size(1)
+        # pe is [max_len, 1, d_model], so we take [:seq_len, 0, :] to get [seq_len, d_model]
+        # then broadcast add to [batch_size, seq_len, d_model]
+        x = x + self.pe[:seq_len, 0, :]
+        return self.dropout(x)
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    """
+    Rotary Position Embedding (RoPE) as described in "RoFormer: Enhanced Transformer with Rotary Position Embedding".
+    
+    RoPE encodes position information by rotating query and key vectors in the embedding space.
+    Unlike additive positional encodings, RoPE naturally captures relative position information
+    and provides better length extrapolation.
+    """
+    def __init__(self, dim: int, max_seq_len: int = 512, base: int = 10000):
+        """
+        :param dim: dimension of the embedding (should be even)
+        :param max_seq_len: maximum sequence length to precompute
+        :param base: base for frequency computation (default 10000 as in original paper)
+        """
+        super(RotaryPositionalEmbedding, self).__init__()
+        
+        # Compute frequencies for rotation
+        # theta_i = base^(-2i/dim) for i in [0, dim/2)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+        
+        # Precompute rotation matrices for efficiency
+        self._seq_len_cached = max_seq_len
+        self._cos_cached = None
+        self._sin_cached = None
+        self._update_cache(max_seq_len)
+    
+    def _update_cache(self, seq_len: int):
+        """Precompute cos and sin values for given sequence length."""
+        self._seq_len_cached = seq_len
+        # Create position indices: [0, 1, 2, ..., seq_len-1]
+        t = torch.arange(seq_len, device=self.inv_freq.device).type_as(self.inv_freq)
+        # Compute frequencies: [seq_len, dim/2]
+        freqs = torch.outer(t, self.inv_freq)
+        # Concatenate to match embedding dimension: [seq_len, dim]
+        emb = torch.cat([freqs, freqs], dim=-1)
+        # Compute cos and sin: [seq_len, dim]
+        self._cos_cached = emb.cos()[None, :, None, :]  # [1, seq_len, 1, dim]
+        self._sin_cached = emb.sin()[None, :, None, :]  # [1, seq_len, 1, dim]
+    
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple:
+        """
+        Apply rotary positional embedding to query and key tensors.
+        
+        :param q: query tensor [batch_size, seq_len, num_heads, head_dim]
+        :param k: key tensor [batch_size, seq_len, num_heads, head_dim]
+        :return: tuple of (rotated_q, rotated_k) with same shapes
+        """
+        seq_len = q.shape[1]
+        
+        # Update cache if needed (either size mismatch or device mismatch)
+        if seq_len > self._seq_len_cached or self._cos_cached.device != q.device:
+            self._update_cache(seq_len)
+        
+        # Ensure cache is on the same device as input (important for multi-GPU training)
+        cos_cached = self._cos_cached.to(q.device)
+        sin_cached = self._sin_cached.to(q.device)
+        
+        # Apply rotation to query and key
+        return (
+            self._apply_rotary_pos_emb(q, cos_cached[:, :seq_len], sin_cached[:, :seq_len]),
+            self._apply_rotary_pos_emb(k, cos_cached[:, :seq_len], sin_cached[:, :seq_len])
+        )
+    
+    @staticmethod
+    def _apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """
+        Apply rotary position embedding using cos and sin.
+        
+        The rotation is applied by: x_rotated = x * cos + rotate_half(x) * sin
+        where rotate_half swaps and negates pairs of dimensions.
+        
+        :param x: input tensor [batch_size, seq_len, num_heads, head_dim]
+        :param cos: cosine values [1, seq_len, 1, head_dim]
+        :param sin: sine values [1, seq_len, 1, head_dim]
+        :return: rotated tensor with same shape as x
+        """
+        # Split x into two halves and rotate
+        x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+        # Apply rotation: [x1*cos - x2*sin, x1*sin + x2*cos]
+        return torch.cat([
+            x1 * cos[..., :x.shape[-1]//2] - x2 * sin[..., x.shape[-1]//2:],
+            x1 * sin[..., :x.shape[-1]//2] + x2 * cos[..., x.shape[-1]//2:]
+        ], dim=-1)
+
+
+class RoPETransformerDecoderLayer(nn.Module):
+    """
+    Custom Transformer Decoder Layer with Rotary Position Embedding (RoPE).
+    
+    This layer replaces PyTorch's standard TransformerDecoderLayer to integrate RoPE
+    directly into the self-attention and cross-attention mechanisms.
+    """
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, 
+                 dropout: float = 0.1, activation: str = 'relu', max_seq_len: int = 512):
+        """
+        :param d_model: embedding dimension
+        :param nhead: number of attention heads
+        :param dim_feedforward: dimension of feedforward network
+        :param dropout: dropout rate
+        :param activation: activation function ('relu' or 'gelu')
+        :param max_seq_len: maximum sequence length for RoPE
+        """
+        super(RoPETransformerDecoderLayer, self).__init__()
+        
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        assert d_model % nhead == 0, "d_model must be divisible by nhead"
+        
+        # RoPE for positional encoding
+        self.rope = RotaryPositionalEmbedding(self.head_dim, max_seq_len=max_seq_len)
+        
+        # Self-attention components
+        self.self_attn_q = nn.Linear(d_model, d_model)
+        self.self_attn_k = nn.Linear(d_model, d_model)
+        self.self_attn_v = nn.Linear(d_model, d_model)
+        self.self_attn_out = nn.Linear(d_model, d_model)
+        
+        # Cross-attention components (for attending to encoder memory)
+        self.cross_attn_q = nn.Linear(d_model, d_model)
+        self.cross_attn_k = nn.Linear(d_model, d_model)
+        self.cross_attn_v = nn.Linear(d_model, d_model)
+        self.cross_attn_out = nn.Linear(d_model, d_model)
+        
+        # Feedforward network
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        
+        # Layer normalization
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        
+        # Activation
+        self.activation = nn.ReLU() if activation == 'relu' else nn.GELU()
+    
+    def _reshape_for_attention(self, x: torch.Tensor) -> torch.Tensor:
+        """Reshape tensor for multi-head attention: [B, L, D] -> [B, L, H, D/H]"""
+        batch_size, seq_len, _ = x.shape
+        return x.view(batch_size, seq_len, self.nhead, self.head_dim)
+    
+    def _compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                          attn_mask: torch.Tensor = None, key_padding_mask: torch.Tensor = None,
+                          apply_rope: bool = False) -> torch.Tensor:
+        """
+        Compute multi-head attention with optional RoPE.
+        
+        :param q: query [B, L_q, D]
+        :param k: key [B, L_k, D]
+        :param v: value [B, L_v, D]
+        :param attn_mask: attention mask [L_q, L_k]
+        :param key_padding_mask: key padding mask [B, L_k]
+        :param apply_rope: whether to apply RoPE to q and k
+        :return: attention output [B, L_q, D]
+        """
+        batch_size = q.shape[0]
+        
+        # Reshape to multi-head format: [B, L, H, D/H]
+        q = self._reshape_for_attention(q)
+        k = self._reshape_for_attention(k)
+        v = self._reshape_for_attention(v)
+        
+        # Apply RoPE if requested (for self-attention on decoder)
+        if apply_rope:
+            q, k = self.rope(q, k)
+        
+        # Transpose for attention computation: [B, H, L, D/H]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Compute attention scores: [B, H, L_q, L_k]
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        
+        # Apply attention mask (causal mask for decoder self-attention)
+        # Expects FloatTensor with -inf for masked positions, 0 for allowed positions
+        if attn_mask is not None:
+            attn_scores = attn_scores + attn_mask
+        
+        # Apply key padding mask
+        if key_padding_mask is not None:
+            attn_scores = attn_scores.masked_fill(
+                key_padding_mask.unsqueeze(1).unsqueeze(2),
+                float('-inf')
+            )
+        
+        # Apply softmax and dropout
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply attention to values: [B, H, L_q, D/H]
+        attn_output = torch.matmul(attn_weights, v)
+        
+        # Transpose and reshape back: [B, L_q, D]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        
+        return attn_output
+    
+    def forward(self, tgt: torch.Tensor, memory: torch.Tensor,
+                tgt_mask: torch.Tensor = None, memory_mask: torch.Tensor = None,
+                tgt_key_padding_mask: torch.Tensor = None,
+                memory_key_padding_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Forward pass of decoder layer with RoPE.
+        
+        :param tgt: decoder input [B, L_tgt, D]
+        :param memory: encoder output [B, L_mem, D]
+        :param tgt_mask: causal mask for self-attention [L_tgt, L_tgt]
+        :param memory_mask: mask for cross-attention (usually None)
+        :param tgt_key_padding_mask: padding mask for decoder [B, L_tgt]
+        :param memory_key_padding_mask: padding mask for encoder memory [B, L_mem]
+        :return: decoder layer output [B, L_tgt, D]
+        """
+        # Self-attention with RoPE
+        q = self.self_attn_q(tgt)
+        k = self.self_attn_k(tgt)
+        v = self.self_attn_v(tgt)
+        
+        tgt2 = self._compute_attention(
+            q, k, v,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
+            apply_rope=True  # Apply RoPE for self-attention
+        )
+        tgt2 = self.self_attn_out(tgt2)
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+        
+        # Cross-attention (no RoPE - attending to encoder memory)
+        q = self.cross_attn_q(tgt)
+        k = self.cross_attn_k(memory)
+        v = self.cross_attn_v(memory)
+        
+        tgt2 = self._compute_attention(
+            q, k, v,
+            attn_mask=memory_mask,
+            key_padding_mask=memory_key_padding_mask,
+            apply_rope=False  # No RoPE for cross-attention
+        )
+        tgt2 = self.cross_attn_out(tgt2)
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+        
+        # Feedforward network
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+        
+        return tgt

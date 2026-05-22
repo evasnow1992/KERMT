@@ -40,7 +40,7 @@ The general utility functions.
 import csv
 import logging
 import os
-import json
+import pickle
 import random
 import math
 from argparse import Namespace
@@ -323,8 +323,8 @@ def split_data(data: MoleculeDataset,
         for split in range(3):
             split_indices = []
             for index in index_set[split]:
-                with open(os.path.join(args.crossval_index_dir, f'{index}.json'), 'r') as rf:
-                    split_indices.extend(json.load(rf))
+                with open(os.path.join(args.crossval_index_dir, f'{index}.pkl'), 'rb') as rf:
+                    split_indices.extend(pickle.load(rf))
             data_split.append([data[i] for i in split_indices])
         train, val, test = tuple(data_split)
         return MoleculeDataset(train), MoleculeDataset(val), MoleculeDataset(test)
@@ -344,8 +344,12 @@ def split_data(data: MoleculeDataset,
         assert folds_file is not None
         assert test_fold_index is not None
 
-        with open(folds_file, 'r') as f:
-            all_fold_indices = json.load(f)
+        try:
+            with open(folds_file, 'rb') as f:
+                all_fold_indices = pickle.load(f)
+        except UnicodeDecodeError:
+            with open(folds_file, 'rb') as f:
+                all_fold_indices = pickle.load(f, encoding='latin1')  # in case we're loading indices from python2
         # assert len(data) == sum([len(fold_indices) for fold_indices in all_fold_indices])
 
         log_scaffold_stats(data, all_fold_indices, logger=logger)
@@ -717,7 +721,17 @@ def load_checkpoint(path: str,
     state = torch.load(path, map_location=lambda storage, loc: storage, weights_only=False)
     args, loaded_state_dict = state['args'], state['state_dict']
 
+    # Transform parameter names for compatibility
+    # 1. Replace old "grover" naming with "kermt"
     loaded_state_dict = OrderedDict([(k.replace("grover", "kermt"), v) for k, v in loaded_state_dict.items()])
+    
+    # 2. Handle CMIM checkpoint format: strip "latent_dist." prefix
+    #    This transforms "latent_dist.kermt.*" -> "kermt.*" for finetuning compatibility
+    has_cmim_params = any("latent_dist." in k for k in loaded_state_dict.keys())
+    if has_cmim_params:
+        debug("Detected CMIM checkpoint format. Transforming 'latent_dist.kermt.*' -> 'kermt.*' for finetuning compatibility.")
+    loaded_state_dict = OrderedDict([(k.replace("latent_dist.", ""), v) for k, v in loaded_state_dict.items()])
+    
     model_ralated_args = get_model_args()
 
     if current_args is not None:

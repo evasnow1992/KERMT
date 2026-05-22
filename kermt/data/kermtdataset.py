@@ -18,6 +18,45 @@ from kermt.util.features import FeatureRange, get_feature_range
 
 import cuik_molmaker
 
+
+def setup_cuik_molmaker_features(args):
+    """
+    Helper function to set up cuik-molmaker feature tensors and ranges.
+    Shared by both KermtCollator and KermtDecoderCollator.
+    
+    Args:
+        args: Training arguments with use_cuikmolmaker_featurization flag
+        
+    Returns:
+        tuple: (cmm_feature_tensors dict, cmm_feature_range) or (None, None)
+    """
+    if not args.use_cuikmolmaker_featurization:
+        return None, None
+    
+    # Define feature properties
+    atom_onehot_props = [
+        "atomic-number", "total-degree", "formal-charge", "chirality",
+        "num-hydrogens", "hybridization", "implicit-valence", "ring-size"
+    ]
+    atom_float_props = [
+        "aromatic", "mass", "hydrogen-bond-acceptor",
+        "hydrogen-bond-donor", "acidic", "basic"
+    ]
+    bond_props = ["is-null", "bond-type-onehot", "conjugated", "in-ring", "stereo"]
+    
+    # Form feature tensors
+    cmm_feature_tensors = {
+        "atom_onehot": cuik_molmaker.atom_onehot_feature_names_to_tensor(atom_onehot_props),
+        "atom_float": cuik_molmaker.atom_float_feature_names_to_tensor(atom_float_props),
+        "bond": cuik_molmaker.bond_feature_names_to_tensor(bond_props)
+    }
+    
+    # Get feature ranges
+    cmm_feature_range = get_feature_range(atom_onehot_props, atom_float_props)
+    
+    return cmm_feature_tensors, cmm_feature_range
+
+
 def get_data(data_path, logger=None):
     """
     Load data from the data_path.
@@ -171,6 +210,183 @@ class BatchMolDataset(Dataset):
         return res
 
 
+class KermtDecoderCollator(object):
+    """
+    Collator for CMIM training with transformer decoder.
+    Prepares graph input for encoder and tokenized SMILES for decoder.
+    """
+    
+    def __init__(self, shared_dict, smiles_vocab, args):
+        """
+        Args:
+            shared_dict: Shared dictionary for mol2graph caching
+            smiles_vocab: SMILESVocab instance for tokenization
+            args: Training arguments
+        """
+        self.args = args
+        self.shared_dict = shared_dict
+        self.smiles_vocab = smiles_vocab
+        
+        # Setup cuik-molmaker features if needed
+        self.cmm_feature_tensors, self.cmm_feature_range = setup_cuik_molmaker_features(args)
+    
+    def tokenize_and_pad_smiles(self, smiles_batch):
+        """
+        Tokenize SMILES strings, truncate if needed, and pad to same length.
+        
+        Args:
+            smiles_batch: List of SMILES strings
+            
+        Returns:
+            tokens: [batch_size, max_len] padded token IDs with <start> and <end>
+            lengths: [batch_size] sequence lengths after truncation (including special tokens)
+            padding_mask: [batch_size, max_len] True where padded
+        """
+        batch_size = len(smiles_batch)
+        
+        # Get max sequence length from args (default 512 from parsing.py)
+        max_seq_len = self.args.decoder_max_seq_len
+        
+        # Tokenize all SMILES (includes <start> and <end>)
+        tokenized = [
+            self.smiles_vocab.smiles_to_ids(smi, add_special_tokens=True)
+            for smi in smiles_batch
+        ]
+        
+        # Truncate sequences that exceed max_seq_len
+        # Keep <start>, truncate middle, ensure <end> is at the end
+        end_token_id = self.smiles_vocab.end_index
+        for i, ids in enumerate(tokenized):
+            if len(ids) > max_seq_len:
+                # Keep first tokens and add <end> at position max_seq_len-1
+                tokenized[i] = ids[:max_seq_len-1] + [end_token_id]
+        
+        # Get lengths (after truncation)
+        lengths = torch.tensor([len(ids) for ids in tokenized], dtype=torch.long)
+        
+        # Pad to same length
+        max_len = max(lengths)
+        pad_idx = self.smiles_vocab.pad_index
+        
+        tokens = torch.full((batch_size, max_len), pad_idx, dtype=torch.long)
+        for i, ids in enumerate(tokenized):
+            tokens[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
+        
+        # Create padding mask (True where padding)
+        padding_mask = tokens == pad_idx
+        
+        return tokens, lengths, padding_mask
+    
+    def prepare_decoder_sequences(self, tokens):
+        """
+        Prepare decoder input and target sequences for teacher forcing.
+        
+        Input:  [<start>, C, C, (, =, O, ), <end>, <pad>, <pad>]
+        Decoder input:  [<start>, C, C, (, =, O, ), <end>, <pad>]  (all except last)
+        Decoder target: [C, C, (, =, O, ), <end>, <pad>, <pad>]     (all except first)
+        
+        Args:
+            tokens: [batch, seq_len] full sequences with <start> and <end>
+            
+        Returns:
+            decoder_input: [batch, seq_len-1] input to decoder
+            decoder_target: [batch, seq_len-1] target for loss
+        """
+        # Decoder input: all tokens except last
+        decoder_input = tokens[:, :-1].contiguous()
+        
+        # Decoder target: all tokens except first (<start>)
+        decoder_target = tokens[:, 1:].contiguous()
+        
+        return decoder_input, decoder_target
+    
+    def create_causal_mask(self, seq_len, device='cpu'):
+        """
+        Create causal mask for autoregressive generation.
+        
+        The mask format depends on the decoder's positional encoding type:
+        - For 'sinusoidal' (PyTorch nn.TransformerDecoder): 
+            BoolTensor where True = masked position (cannot attend)
+        - For 'rope' (custom RoPETransformerDecoderLayer):
+            FloatTensor where -inf = masked position (used with additive masking)
+        
+        Args:
+            seq_len: Sequence length
+            device: Device to create mask on
+            
+        Returns:
+            mask: [seq_len, seq_len] causal mask in appropriate format
+        """
+        # Get positional encoding type from args
+        positional_encoding = getattr(self.args, 'decoder_positional_encoding', 'rope')
+        
+        if positional_encoding == 'sinusoidal':
+            # PyTorch's nn.TransformerDecoder expects BoolTensor
+            # True = masked (cannot attend), False = allowed
+            mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=1)
+        elif positional_encoding == 'rope':
+            # Custom RoPE implementation expects FloatTensor with additive masking
+            # -inf = masked (becomes 0 after softmax), 0 = allowed
+            mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
+            mask = mask.masked_fill(mask == 1, float('-inf'))
+        else:
+            raise ValueError(f"Unknown positional_encoding: {positional_encoding}")
+        
+        return mask
+    
+    def __call__(self, batch_idx):
+        """
+        Collate batch for CMIM decoder training.
+        
+        Args:
+            batch_idx: List of (data, idx) tuples
+            
+        Returns:
+            dict with:
+                - graph_input: Graph components for encoder
+                - decoder_input: [batch, seq_len] tokenized SMILES input
+                - decoder_target: [batch, seq_len] tokenized SMILES target
+                - decoder_padding_mask: [batch, seq_len] padding mask
+                - causal_mask: [seq_len, seq_len] causal mask
+                - smiles: List of original SMILES strings
+                - idx: Batch indices
+        """
+        batch, idx = zip(*batch_idx)
+        smiles_batch = [d.smiles for d in batch]
+        
+        # Build graph input for encoder (same as KermtCollator)
+        if self.args.use_cuikmolmaker_featurization:
+            batchgraph = mol2graph(smiles_batch, self.shared_dict, self.args, 
+                                  cmm_feature_range=self.cmm_feature_range, 
+                                  cmm_tensors=self.cmm_feature_tensors).get_components()
+        else:
+            batchgraph = mol2graph(smiles_batch, self.shared_dict, self.args).get_components()
+        
+        # Tokenize and pad SMILES
+        tokens, lengths, padding_mask = self.tokenize_and_pad_smiles(smiles_batch)
+        
+        # Prepare decoder sequences (teacher forcing)
+        decoder_input, decoder_target = self.prepare_decoder_sequences(tokens)
+        
+        # Update padding mask to match decoder sequences (shifted)
+        decoder_padding_mask = padding_mask[:, 1:].contiguous()
+        
+        # Create causal mask (same for all samples in batch)
+        seq_len = decoder_input.size(1)
+        causal_mask = self.create_causal_mask(seq_len)
+        
+        res = {
+            "graph_input": batchgraph,
+            "decoder_input": decoder_input,           # [batch, seq_len]
+            "decoder_target": decoder_target,         # [batch, seq_len]
+            "decoder_padding_mask": decoder_padding_mask,  # [batch, seq_len]
+            "causal_mask": causal_mask,               # [seq_len, seq_len]
+            "smiles": smiles_batch,                   # List of strings
+            "idx": idx
+        }
+        return res
+
+
 class KermtCollator(object):
     def __init__(self, shared_dict, atom_vocab, bond_vocab, args):
         self.args = args
@@ -178,26 +394,8 @@ class KermtCollator(object):
         self.atom_vocab = atom_vocab
         self.bond_vocab = bond_vocab
 
-        if args.use_cuikmolmaker_featurization:
-            # Form feature tensors for cuik-molmaker
-            self.cmm_feature_tensors = {}
-            atom_onehot_props = ["atomic-number", "total-degree", "formal-charge", "chirality",
-                                "num-hydrogens", "hybridization",
-                                "implicit-valence", 
-                                "ring-size",
-                                ]
-            self.cmm_feature_tensors["atom_onehot"] = cuik_molmaker.atom_onehot_feature_names_to_tensor(atom_onehot_props)
-            atom_float_props = ["aromatic", "mass", 
-                                "hydrogen-bond-acceptor",
-                                    "hydrogen-bond-donor", 
-                                    "acidic", "basic"
-                                    ]
-            self.cmm_feature_tensors["atom_float"] = cuik_molmaker.atom_float_feature_names_to_tensor(atom_float_props)
-            bond_props = ["is-null", "bond-type-onehot", "conjugated", "in-ring", "stereo"]
-            self.cmm_feature_tensors["bond"] = cuik_molmaker.bond_feature_names_to_tensor(bond_props)
-
-            # Get feature ranges for cuik-molmaker
-            self.cmm_feature_range = get_feature_range(atom_onehot_props, atom_float_props)
+        # Setup cuik-molmaker features if needed
+        self.cmm_feature_tensors, self.cmm_feature_range = setup_cuik_molmaker_features(args)
 
     def atom_random_mask(self, smiles_batch):
         """
@@ -259,7 +457,9 @@ class KermtCollator(object):
         batch, idx = zip(*batch_idx)
         smiles_batch = [d.smiles for d in batch]
         if self.args.use_cuikmolmaker_featurization:
-            batchgraph = mol2graph(smiles_batch, self.shared_dict, self.args, cmm_feature_range=self.cmm_feature_range, cmm_tensors=self.cmm_feature_tensors).get_components()
+            batchgraph = mol2graph(smiles_batch, self.shared_dict, self.args,
+                                  cmm_feature_range=self.cmm_feature_range, 
+                                  cmm_tensors=self.cmm_feature_tensors).get_components()
         else:
             batchgraph = mol2graph(smiles_batch, self.shared_dict, self.args).get_components()
 
