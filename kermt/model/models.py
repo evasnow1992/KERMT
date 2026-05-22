@@ -430,8 +430,23 @@ class KermtFinetuneTask(nn.Module):
         else:
             self.readout = Readout(rtype="mean", hidden_size=self.hidden_size)
 
-        self.mol_atom_from_atom_ffn = self.create_ffn(args)
-        self.mol_atom_from_bond_ffn = self.create_ffn(args)
+        if args.ffn_num_task_specific_layers > 0:
+            ffn_output_size = args.ffn_task_specific_hidden_size
+        else:
+            ffn_output_size = args.output_size
+        self.mol_atom_from_atom_ffn = self.create_ffn(args, ffn_output_size)
+        self.mol_atom_from_bond_ffn = self.create_ffn(args, ffn_output_size)
+
+        if args.ffn_num_task_specific_layers > 0:
+            self.mol_atom_from_atom_ffn_task_specific = nn.ModuleList([self.create_task_specific_ffn(ffn_output_size, args.ffn_num_task_specific_layers,  args.ffn_task_specific_hidden_size, args.dropout, args.activation) for _ in range(args.num_tasks)])
+
+            self.mol_atom_from_bond_ffn_task_specific = nn.ModuleList([self.create_task_specific_ffn(ffn_output_size, args.ffn_num_task_specific_layers,  args.ffn_task_specific_hidden_size, args.dropout, args.activation) for _ in range(args.num_tasks)])
+        else:
+            self.mol_atom_from_atom_ffn_task_specific = None
+            self.mol_atom_from_bond_ffn_task_specific = None
+    
+
+
         #self.ffn = nn.ModuleList()
         #self.ffn.append(self.mol_atom_from_atom_ffn)
         #self.ffn.append(self.mol_atom_from_bond_ffn)
@@ -440,12 +455,38 @@ class KermtFinetuneTask(nn.Module):
         if self.classification:
             self.sigmoid = nn.Sigmoid()
 
-    def create_ffn(self, args: Namespace):
+
+    def create_task_specific_ffn(self, input_size: int, num_layers: int, hidden_size: int, dropout, activation):
+        dropout_layer = nn.Dropout(dropout)
+        activation_layer = get_activation_function(activation)
+        if num_layers == 1:
+            ffn_ts = [dropout_layer, nn.Linear(input_size, 1)]
+        else:
+            ffn_ts = []
+            for _ in range(num_layers - 1):
+                ffn_ts.extend([
+                    activation_layer,
+                    dropout_layer,
+                    nn.Linear(hidden_size, hidden_size)
+                ])
+            ffn_ts.extend([
+                activation_layer,
+                dropout_layer,
+                nn.Linear(hidden_size, 1)
+            ])
+
+        return nn.Sequential(*ffn_ts)
+
+
+    def create_ffn(self, args: Namespace, output_size: int):
         """
         Creates the feed-forward network for the model.
 
         :param args: Arguments.
         """
+        # Default ffn_hidden_size to hidden_size if not specified
+        ffn_hidden_size = args.ffn_hidden_size if args.ffn_hidden_size is not None else args.hidden_size
+        
         # Note: args.features_dim is set according the real loaded features data
         if args.features_only:
             first_linear_dim = args.features_size + args.features_dim
@@ -463,13 +504,12 @@ class KermtFinetuneTask(nn.Module):
 
         dropout = nn.Dropout(args.dropout)
         activation = get_activation_function(args.activation)
-        # Default ffn_hidden_size to hidden_size if not specified
-        ffn_hidden_size = args.ffn_hidden_size if args.ffn_hidden_size is not None else args.hidden_size
+        
         # Create FFN layers
         if args.ffn_num_layers == 1:
             ffn = [
                 dropout,
-                nn.Linear(first_linear_dim, args.output_size)
+                nn.Linear(first_linear_dim, output_size)
             ]
         else:
             ffn = [
@@ -485,7 +525,7 @@ class KermtFinetuneTask(nn.Module):
             ffn.extend([
                 activation,
                 dropout,
-                nn.Linear(ffn_hidden_size, args.output_size),
+                nn.Linear(ffn_hidden_size, output_size),
             ])
 
         # Create FFN model
@@ -548,13 +588,41 @@ class KermtFinetuneTask(nn.Module):
         if self.training:
             atom_ffn_output = self.mol_atom_from_atom_ffn(mol_atom_from_atom_output)
             bond_ffn_output = self.mol_atom_from_bond_ffn(mol_atom_from_bond_output)
-            return atom_ffn_output, bond_ffn_output
+            atom_preds = []
+            bond_preds = []
+            if self.mol_atom_from_atom_ffn_task_specific is not None: # TODO
+                for _, task_layer in enumerate(self.mol_atom_from_atom_ffn_task_specific):
+                    atom_preds.append(task_layer(atom_ffn_output))
+                for _, task_layer in enumerate(self.mol_atom_from_bond_ffn_task_specific):
+                    bond_preds.append(task_layer(bond_ffn_output))
+                return torch.hstack(atom_preds), torch.hstack(bond_preds)
+            else:
+                return atom_ffn_output, bond_ffn_output
         else:
             atom_ffn_output = self.mol_atom_from_atom_ffn(mol_atom_from_atom_output)
             bond_ffn_output = self.mol_atom_from_bond_ffn(mol_atom_from_bond_output)
-            if self.classification:
-                atom_ffn_output = self.sigmoid(atom_ffn_output)
-                bond_ffn_output = self.sigmoid(bond_ffn_output)
-            output = (atom_ffn_output + bond_ffn_output) / 2
+
+            if self.mol_atom_from_atom_ffn_task_specific is not None:
+                atom_preds_list = []
+                bond_preds_list = []
+                for _, task_layer in enumerate(self.mol_atom_from_atom_ffn_task_specific):
+                    atom_preds_list.append(task_layer(atom_ffn_output))
+                for _, task_layer in enumerate(self.mol_atom_from_bond_ffn_task_specific):
+                    bond_preds_list.append(task_layer(bond_ffn_output))
+                atom_preds = torch.hstack(atom_preds_list)
+                bond_preds = torch.hstack(bond_preds_list)
+                if self.classification:
+                    atom_preds = self.sigmoid(atom_preds)
+                    bond_preds = self.sigmoid(bond_preds)
+                    output = (atom_preds + bond_preds) / 2
+                else:
+                    output = (atom_preds + bond_preds) / 2
+            else:
+                if self.classification:
+                    atom_ffn_output = self.sigmoid(atom_ffn_output)
+                    bond_ffn_output = self.sigmoid(bond_ffn_output)
+                    output = (atom_ffn_output + bond_ffn_output) / 2
+                else:
+                    output = (atom_ffn_output + bond_ffn_output) / 2
 
         return output

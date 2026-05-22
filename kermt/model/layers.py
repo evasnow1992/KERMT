@@ -262,7 +262,7 @@ class MPNEncoder(nn.Module):
                 lower = mu - 3 * sigma
                 upper = mu + 3 * sigma
                 X = stats.truncnorm((lower - mu) / sigma, (upper - mu) / sigma, loc=mu, scale=sigma)
-                ndepth = int(X.rvs())
+                ndepth = int(X.rvs())  # Use rvs() without size arg to get scalar (scipy compatibility)
         else:
             ndepth = self.depth
 

@@ -38,7 +38,7 @@
 The parsing functions for the argument input.
 """
 import os
-import pickle
+import json
 from argparse import ArgumentParser, Namespace
 from tempfile import TemporaryDirectory
 
@@ -58,6 +58,11 @@ def add_common_args(parser: ArgumentParser):
                         help='Turn off cuda')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size')
+    parser.add_argument('--wandb_project', type=str,
+                        help='Wandb project name. If this is provided, WandB will be used to log the training process.')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                        help='Wandb run name')
+
 
 
 def add_predict_args(parser: ArgumentParser):
@@ -82,13 +87,11 @@ def add_predict_args(parser: ArgumentParser):
                         help='Method of generating additional features')
     parser.add_argument('--features_path', type=str, nargs='*',
                         help='Path to features to use in FNN (instead of features_generator)')
+    parser.add_argument('--use_cuikmolmaker_featurization', action='store_true', default=False,
+                        help='Use cuik-molmaker package for featurization of atoms and bonds in molecules')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for prediction')
     parser.add_argument('--no_features_scaling', action='store_true', default=False,
                         help='Turn off scaling of features')
-    parser.add_argument('--rdkit2D_normalization_type', type=str, choices=("fast", "best", "descriptastorus"), default='fast',
-                        help='Type of normalization for rdkit2D features. Choices: fast, best, descriptastorus')
-    parser.add_argument('--use_cuikmolmaker_featurization', action='store_true', default=False,
-                        help='Use cuik-molmaker package for featurization of atoms and bonds in molecules')
 
 
 def add_fingerprint_args(parser):
@@ -237,6 +240,7 @@ def add_finetune_args(parser: ArgumentParser):
     parser.add_argument('--activation', type=str, default='ReLU',
                         choices=['ReLU', 'LeakyReLU', 'PReLU', 'tanh', 'SELU', 'ELU'],
                         help='Activation function')
+    
     # Encoder architecture arguments (required when training from scratch without checkpoint)
     parser.add_argument('--hidden_size', type=int, default=800,
                         help='Encoder hidden dimension. Default: 800 (matches pretrained models)')
@@ -250,11 +254,17 @@ def add_finetune_args(parser: ArgumentParser):
                         help='Whether to add bias to encoder linear layers. Default: False')
     parser.add_argument('--undirected', action='store_true', default=False,
                         help='Use undirected edges (sum the two relevant bond vectors). Default: False')
-
+    
     parser.add_argument('--ffn_hidden_size', type=int, default=None,
                         help='Hidden dim for higher-capacity FFN (defaults to hidden_size)')
     parser.add_argument('--ffn_num_layers', type=int, default=2,
                         help='Number of layers in FFN after MPN encoding')
+    parser.add_argument('--ffn_task_specific_hidden_size', type=int, default=None,
+                        help='Hidden size for task-specific FFN layers (and common FFN '
+                             'output when task-specific layers are used). Required if '
+                             'ffn_num_task_specific_layers > 0.')
+    parser.add_argument('--ffn_num_task_specific_layers', type=int, default=0,
+                        help='Number of task-specific layers in FFN after common FFN layer encoding')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='weight_decay')
     parser.add_argument('--select_by_loss', action='store_true', default=False,
                         help='Use validation loss as refence standard to select best model to predict')
@@ -278,7 +288,7 @@ def add_finetune_args(parser: ArgumentParser):
     parser.add_argument('--bond_drop_rate', type=float, default=0, help='Drop out bond in molecular.')
     parser.add_argument('--distinct_init', action='store_true', default=False,
                         help='Using distinct weight init for model ensemble')
-    parser.add_argument('--fine_tune_coff', type=float, default=1,
+    parser.add_argument('--fine_tune_coff', type=float, default=1.0,
                         help='Enable distinct fine tune learning rate for fc and other layer')
 
     # For multi-gpu finetune.
@@ -511,8 +521,8 @@ def modify_train_args(args: Namespace):
     assert (args.split_type == 'crossval') == (args.crossval_index_dir is not None)
     assert (args.split_type in ['crossval', 'index_predetermined']) == (args.crossval_index_file is not None)
     if args.split_type in ['crossval', 'index_predetermined']:
-        with open(args.crossval_index_file, 'rb') as rf:
-            args.crossval_index_sets = pickle.load(rf)
+        with open(args.crossval_index_file, 'r') as rf:
+            args.crossval_index_sets = json.load(rf)
         args.num_folds = len(args.crossval_index_sets)
         args.seed = 0
 
@@ -521,6 +531,9 @@ def modify_train_args(args: Namespace):
         args.no_cache = True
 
     setattr(args, 'fingerprint', False)
+    
+    # Set dense=False for encoder (required when training from scratch)
+    args.dense = False
 
     # Set dense=False for encoder (required when training from scratch)
     args.dense = False

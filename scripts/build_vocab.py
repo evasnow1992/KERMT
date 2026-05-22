@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument('--vocab_save_folder', type=str, help="Path to the folder where the vocab files will be saved")
     parser.add_argument('--dataset_name', type=str, default=None,
                         help="Will be the first part of the vocab file name. If it is None,"
-                             "the vocab files will be: atom_vocab.pkl and bond_vocab.pkl")
+                             "the vocab files will be: atom_vocab.json and bond_vocab.json")
     parser.add_argument('--vocab_max_size', type=int, default=None)
     parser.add_argument('--vocab_min_freq', type=int, default=1)
     args = parser.parse_args()
@@ -55,7 +55,7 @@ def parse_args():
 
 def build(args):
     for vocab_type in ['atom', 'bond']:
-        vocab_file = f"{vocab_type}_vocab.pkl"
+        vocab_file = f"{vocab_type}_vocab.json"
         if args.dataset_name is not None:
             vocab_file = args.dataset_name + '_' + vocab_file
         vocab_save_path = os.path.join(args.vocab_save_folder, vocab_file)

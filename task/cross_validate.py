@@ -53,7 +53,7 @@ from kermt.util.utils import get_task_names
 from kermt.util.utils import makedirs
 from task.run_evaluation import run_evaluation
 from task.train import run_training
-
+import wandb
 
 def cross_validate(args: Namespace, logger: Logger = None) -> Tuple[float, float]:
     """
@@ -68,14 +68,22 @@ def cross_validate(args: Namespace, logger: Logger = None) -> Tuple[float, float
     save_dir = args.save_dir
     task_names = get_task_names(args.data_path)
 
+    if args.wandb_project:
+        wandb.login()
+        wandb.init(
+            project=getattr(args, "wandb_project", "grover"),
+            name=getattr(args, "wandb_run_name", None),
+            config=vars(args),
+            dir=args.save_dir if hasattr(args, "save_dir") else None,
+            resume="allow"
+        )
+
     # Run training with different random seeds for each fold
     all_scores = []
     for fold_num in range(args.num_folds):
         info(f'Fold {fold_num}')
         args.seed = init_seed + fold_num
-        args.save_dir = os.path.join(save_dir, f'fold_{fold_num}')
-        makedirs(args.save_dir)
-
+        
         # Reset random seeds for this fold to ensure different model initialization
         # This is important when using separate train/val/test paths (no data splitting)
         # so that each fold produces a model with different random weight initialization
@@ -83,6 +91,9 @@ def cross_validate(args: Namespace, logger: Logger = None) -> Tuple[float, float
         torch.cuda.manual_seed_all(args.seed)
         np.random.seed(args.seed)
         random.seed(args.seed)
+        
+        args.save_dir = os.path.join(save_dir, f'fold_{fold_num}')
+        makedirs(args.save_dir)
         if args.parser_name == "finetune":
             model_scores = run_training(args, logger)
         else:

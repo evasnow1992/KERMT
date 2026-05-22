@@ -1,4 +1,5 @@
 import random
+import subprocess
 
 import numpy as np
 import torch
@@ -21,6 +22,14 @@ def setup(seed):
     torch.backends.cudnn.deterministic = True
     torch.use_deterministic_algorithms(mode=True)
 
+def get_git_branch_commit():
+    try:
+        branch = subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], stderr=subprocess.STDOUT).decode().strip()
+        commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], stderr=subprocess.STDOUT).decode().strip()
+        return branch, commit
+    except Exception:
+        return None, None
+
 class UserError(Exception):
     pass
 
@@ -40,6 +49,9 @@ if __name__ == '__main__':
     print(f"Setting up with random seed: {args.seed}")
     setup(seed=args.seed)
     print(f"args: {args}")
+
+    branch, commit = get_git_branch_commit()
+    print(f"Git branch: {branch}, Commit: {commit}")
     
     if args.parser_name == 'finetune':
         logger = create_logger(name='train', save_dir=args.save_dir, quiet=False)

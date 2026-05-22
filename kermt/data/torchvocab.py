@@ -1,7 +1,7 @@
 """
 The contextual property.
 """
-import pickle
+import json
 from collections import Counter
 from multiprocessing import Pool
 
@@ -83,14 +83,35 @@ class TorchVocab(object):
             seq = [self.stoi.get(bond_to_vocab(mol, bond), self.other_index) for i, bond in enumerate(mol.GetBonds())]
         return (seq, len(seq)) if with_len else seq
 
-    @staticmethod
-    def load_vocab(vocab_path: str) -> 'TorchVocab':
-        with open(vocab_path, "rb") as f:
-            return pickle.load(f)
+    def to_dict(self):
+        return {
+            'freqs': dict(self.freqs),
+            'itos': self.itos,
+            'stoi': self.stoi,
+            'vocab_type': self.vocab_type,
+            'other_index': self.other_index,
+            'pad_index': self.pad_index,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        vocab = object.__new__(cls)
+        vocab.freqs = Counter(d['freqs'])
+        vocab.itos = d['itos']
+        vocab.stoi = d['stoi']
+        vocab.vocab_type = d['vocab_type']
+        vocab.other_index = d['other_index']
+        vocab.pad_index = d['pad_index']
+        return vocab
+
+    @classmethod
+    def load_vocab(cls, vocab_path: str) -> 'TorchVocab':
+        with open(vocab_path, "r") as f:
+            return cls.from_dict(json.load(f))
 
     def save_vocab(self, vocab_path):
-        with open(vocab_path, "wb") as f:
-            pickle.dump(self, f)
+        with open(vocab_path, "w") as f:
+            json.dump(self.to_dict(), f)
 
 
 class MolVocab(TorchVocab):
@@ -187,7 +208,7 @@ class MolVocab(TorchVocab):
         # print("end")
         return sub_counter
 
-    @staticmethod
-    def load_vocab(vocab_path: str) -> 'MolVocab':
-        with open(vocab_path, "rb") as f:
-            return pickle.load(f)
+    @classmethod
+    def load_vocab(cls, vocab_path: str) -> 'MolVocab':
+        with open(vocab_path, "r") as f:
+            return cls.from_dict(json.load(f))

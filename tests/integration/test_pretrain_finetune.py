@@ -40,9 +40,9 @@ def pretrain_ddp(data_dir, world_size):
         "--train_data_path", str(data_dir / "pretrain/train_9k"),
         "--val_data_path", str(data_dir / "pretrain/val_1k"),
         "--save_dir", f"test_run/pretrain/model/train_val_ws{world_size}",
-        "--atom_vocab_path", str(data_dir / "pretrain/pretrain_atom_vocab.pkl"),
-        "--bond_vocab_path", str(data_dir / "pretrain/pretrain_bond_vocab.pkl"),
-        "--batch_size", "256",
+        "--atom_vocab_path", str(data_dir / "pretrain/pretrain_atom_vocab.json"),
+        "--bond_vocab_path", str(data_dir / "pretrain/pretrain_bond_vocab.json"),
+        "--batch_size", "32",
         "--dropout", "0.1",
         "--depth", "6",
         "--num_attn_head", "4",
@@ -118,8 +118,6 @@ def predict(data_dir):
         "--data_path", str(data_dir / "finetune/test.csv"),
         "--checkpoint_dir", "test_run/finetune/",
         "--no_features_scaling",
-        "--features_generator", "rdkit_2d_normalized_cuik_molmaker",
-        "--rdkit2D_normalization_type", "descriptastorus",
         "--output", "test_run/predict/predict.csv"
     ]
     env = os.environ.copy()
@@ -132,6 +130,7 @@ def predict(data_dir):
 
 
 def test_pretrain_ddp_finetune(data_dir):
+    import torch
     os.makedirs("test_run", exist_ok=True)
 
     world_size = 1
@@ -147,9 +146,14 @@ def test_pretrain_ddp_finetune(data_dir):
     predict(data_dir)
     print("Prediction completed")
 
-    world_size = 2
-    pretrain_ddp(data_dir, world_size)
-    print(f"Pre-trained with world size {world_size} completed")
+    # Only test multi-GPU if enough GPUs are available
+    num_gpus = torch.cuda.device_count()
+    if num_gpus >= 2:
+        world_size = 2
+        pretrain_ddp(data_dir, world_size)
+        print(f"Pre-trained with world size {world_size} completed")
+    else:
+        print(f"Skipping multi-GPU test (only {num_gpus} GPU(s) available)")
 
     # Cleanup 
     if os.path.exists("test_run"):

@@ -41,6 +41,9 @@ from kermt.data.kermtdataset import BatchMolDataset
 from kermt.util.parsing import parse_args_ddp
 from kermt.util.nn_utils import param_count_trainable, param_count_total
 
+def pre_load_data_ddp(dataset: BatchMolDataset, dataset_size: int, samples_per_file: int):
+    for i in range(1, dataset_size, samples_per_file):
+        dataset.load_data(i)
 
 def configure_nccl_for_topology():
     """
@@ -52,14 +55,14 @@ def configure_nccl_for_topology():
     if "NCCL_P2P_DISABLE" in os.environ:
         print(f"[INFO] Using user-provided NCCL settings: NCCL_P2P_DISABLE={os.environ['NCCL_P2P_DISABLE']}")
         return
-
+    
     # Try to detect GPU topology
     try:
         import subprocess
-        result = subprocess.run(['nvidia-smi', 'topo', '-m'],
+        result = subprocess.run(['nvidia-smi', 'topo', '-m'], 
                               capture_output=True, text=True, timeout=5)
         topo_output = result.stdout
-
+        
         # Check for poor GPU connectivity (SYS or NODE topology)
         # These topologies typically don't support P2P well
         if 'SYS' in topo_output or 'NODE' in topo_output:
@@ -77,11 +80,6 @@ def configure_nccl_for_topology():
         os.environ["NCCL_P2P_DISABLE"] = "1"
         os.environ["NCCL_IB_DISABLE"] = "1"
         os.environ["NCCL_SHM_DISABLE"] = "0"
-
-
-def pre_load_data_ddp(dataset: BatchMolDataset, dataset_size: int, samples_per_file: int):
-    for i in range(1, dataset_size, samples_per_file):
-        dataset.load_data(i)
 
 def ddp_setup(rank, world_size):
     """
@@ -216,11 +214,12 @@ def main(rank: int, world_size: int):
 
 if __name__ == "__main__":
 
-    # Auto-configure NCCL before spawning processes
-    # This detects GPU topology and sets appropriate P2P settings
-    configure_nccl_for_topology()
-
     world_size = os.environ.get("WORLD_SIZE", 1)
     world_size = int(world_size)
     print(f"World size: {world_size}")
+    
+    # Auto-configure NCCL before spawning processes
+    # This detects GPU topology and sets appropriate P2P settings
+    configure_nccl_for_topology()
+    
     mp.spawn(main, args=(world_size, ), nprocs=world_size)

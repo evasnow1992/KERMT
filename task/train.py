@@ -40,7 +40,7 @@ The training function used in the finetuning task.
 import csv
 import logging
 import os
-import pickle
+import json
 import time
 from argparse import Namespace
 from logging import Logger
@@ -48,18 +48,19 @@ from typing import List
 
 import numpy as np
 import pandas as pd
+import wandb
 import torch
 from torch.optim.lr_scheduler import ExponentialLR
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 from kermt.data import MolCollator
 from kermt.data import StandardScaler
 from kermt.util.metrics import get_metric_func
 from kermt.util.nn_utils import initialize_weights, param_count_trainable, param_count_total
-from torch.utils.tensorboard import SummaryWriter
 from kermt.util.scheduler import NoamLR
 from kermt.util.utils import build_optimizer, build_lr_scheduler, makedirs, load_checkpoint, get_loss_func, \
-    save_checkpoint, save_model_for_restart, build_model
+    save_checkpoint, build_model, get_ffn_layer_names, save_model_for_restart
 from kermt.util.utils import get_class_sizes, get_data, split_data, get_task_names
 from task.predict import predict, evaluate, evaluate_predictions
 
@@ -79,7 +80,6 @@ def train(epoch, model, data, loss_func, optimizer, scheduler,
     :param args: Arguments.
     :param n_iter: The number of iterations (training examples) trained on so far.
     :param logger: A logger for printing intermediate results.
-    :param writer: A tensorboardX SummaryWriter.
     :return: The total number of iterations (training examples) trained on so far.
     """
     # debug = logger.debug if logger is not None else print
@@ -167,7 +167,7 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
     # Set up test set evaluation
     test_smiles, test_targets = test_data.smiles(), test_data.targets()
     sum_test_preds = np.zeros((len(test_smiles), args.num_tasks))
-
+    
     # Check if test data is blinded (no target columns)
     is_blinded_test = len(test_targets) == 0 or (len(test_targets) > 0 and len(test_targets[0]) == 0)
 
@@ -175,12 +175,13 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
     for model_idx in range(args.ensemble_size):
         save_dir = os.path.join(args.save_dir, f'model_{model_idx}')
         makedirs(save_dir)
-
+        
         # Initialize TensorBoard writer if enabled
         if args.tensorboard:
             writer = SummaryWriter(save_dir)
 
         # Load/build model
+        start_epoch = 0  # Default: start from epoch 0
         if args.checkpoint_paths is not None:
             if len(args.checkpoint_paths) == 1:
                 cur_model = 0
@@ -197,15 +198,14 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
         loss_func = get_loss_func(args, model)
 
         optimizer = build_optimizer(model, args)
-
+        
         debug(model)
         debug(f'Number of trainable parameters = {param_count_trainable(model):,}')
         debug(f'Number of total parameters = {param_count_total(model):,}')
         if args.cuda:
             debug('Moving model to cuda')
             model = model.cuda()
-
-        start_epoch = 0  # Default: start from epoch 0
+        
         # Try to load optimizer state - only use start_epoch if optimizer loads successfully
         # (indicates resuming a finetune job vs starting fresh from pretrain checkpoint)
         if args.checkpoint_paths is not None and "optimizer" in loaded_ckpt_state:
@@ -225,19 +225,14 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
 
         # Learning rate schedulers
         scheduler = build_lr_scheduler(optimizer, args)
-
         # Only load scheduler state if we're resuming (start_epoch > 0 means optimizer loaded successfully)
         if start_epoch > 0 and "scheduler" in loaded_ckpt_state:
             try:
                 print(f"Loading scheduler state from checkpoint: {args.checkpoint_paths[cur_model]}")
                 scheduler.load_state_dict(loaded_ckpt_state["scheduler"])
             except (ValueError, KeyError) as e:
-                raise RuntimeError(
-                    f"Failed to load scheduler state from checkpoint "
-                    f"{args.checkpoint_paths[cur_model]}: {e}. "
-                    f"Optimizer loaded successfully (start_epoch={start_epoch}) "
-                    f"but scheduler is incompatible — checkpoint may be corrupted."
-                ) from e
+                print(f"Could not load scheduler state: {e}")
+                print("Starting with fresh scheduler state.")
 
         # Bulid data_loader
         shuffle = True
@@ -299,6 +294,16 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
                   't_time: {:.4f}s'.format(t_time),
                   'v_time: {:.4f}s'.format(v_time),
                   flush=True)
+            if args.wandb_project:
+                wandb.log({
+                    "epoch": epoch,
+                    "train/loss": train_loss,
+                    "train/time": t_time,
+                    "val/time": v_time,
+                    "val/loss": val_loss,
+                    f"val/{args.metric}": avg_val_score,
+                    "cur_lr": scheduler.get_lr()[-1],
+                })
 
             if args.tensorboard:
                 writer.add_scalar('loss/train', train_loss, epoch)
@@ -312,7 +317,7 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
             else:
                 curr_epoch_best_by_loss = False
 
-            save_model_for_restart(os.path.join(save_dir, 'last_checkpoint.pt'), model, optimizer, scheduler, scaler, features_scaler, args,
+            save_model_for_restart(os.path.join(save_dir, 'last_checkpoint.pt'), model, optimizer, scheduler, scaler, features_scaler, args, 
             epoch+1 # save with +1 so that loaded checkpoint will start from the next epoch
             )
             # Save model checkpoint if improved validation score
@@ -400,13 +405,18 @@ def run_training(args: Namespace, logger: Logger = None, return_val=False) -> Li
             if args.show_individual_scores:
                 for task_name, ensemble_score in zip(args.task_names, ensemble_scores):
                     info(f'Ensemble test {task_name} {args.metric} = {ensemble_score:.6f}')
+
+            # Log to wandb if enabled
+            if args.wandb_project:
+                for task_name, ensemble_score in zip(args.task_names, ensemble_scores):
+                    wandb.summary[f"test/{task_name}_{args.metric}"] = ensemble_score
         else:
             # Blinded test data - output predictions only
             ensemble_scores = [float('nan')] * args.num_tasks
             test_result = pd.DataFrame(avg_test_preds, index=test_smiles, columns=args.task_names)
             test_result.to_csv(os.path.join(args.save_dir, 'test_result.csv'))
             info(f'Ensemble test: Blinded data - predictions saved to test_result.csv')
-
+        
         # Close TensorBoard writer
         if args.tensorboard:
             writer.close()
@@ -529,6 +539,6 @@ def save_splits(args, test_data, train_data, val_data):
             split_indices.append(indices_by_smiles[smiles])
             split_indices = sorted(split_indices)
         all_split_indices.append(split_indices)
-    with open(os.path.join(args.save_dir, 'split_indices.pckl'), 'wb') as f:
-        pickle.dump(all_split_indices, f)
+    with open(os.path.join(args.save_dir, 'split_indices.json'), 'w') as f:
+        json.dump(all_split_indices, f)
     return writer

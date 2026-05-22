@@ -372,7 +372,7 @@ class KERMTTrainer:
         tmp_output_path = output_path + ".tmp"
         torch.save(state, tmp_output_path)
         os.replace(tmp_output_path, output_path)  # atomic on POSIX
-
+        
         if save_last:
             last_path = os.path.join(file_path, "last_checkpoint.pt")
             tmp_last_path = last_path + ".tmp"

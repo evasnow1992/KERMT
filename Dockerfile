@@ -13,7 +13,6 @@ RUN wget https://repo.anaconda.com/miniconda/Miniconda3-py311_25.5.1-0-Linux-x86
     && /bin/bash miniconda.sh -b -p /softwares/miniconda3 \
     && rm -v miniconda.sh
 ENV PATH="/softwares/miniconda3/bin:${PATH}"
-ENV LD_LIBRARY_PATH="/softwares/miniconda3/lib:${LD_LIBRARY_PATH}"
 
 # install Python packages
 RUN pip install --upgrade pip
@@ -48,6 +47,9 @@ RUN rm -rf /code/.git /code/.code-workspace
 
 # Equivalent to `conda activate kermt`
 SHELL ["conda", "run", "--no-capture-output", "-n", "kermt", "/bin/bash", "-c"]
+
+# Install the cuik_molmaker from wheel
+RUN pip install cuik_molmaker==0.1.1 --index-url https://pypi.nvidia.com/rdkit-2025.03.2_torch-2.7.1/
 
 # provide defaults for the executing container
 CMD [ "/bin/bash" ]
