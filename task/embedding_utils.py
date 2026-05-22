@@ -18,6 +18,12 @@ import numpy as np
 # Available embedding types from KERMT encoder (dual-view architecture)
 EMBEDDING_TYPES = ["atom_from_atom", "atom_from_bond", "bond_from_atom", "bond_from_bond"]
 
+# Optional cMIM/Hybrid projection-layer output (saved as projected.npy by
+# extract_embeddings.py --projection). Treated separately from EMBEDDING_TYPES
+# because (a) it has a different shape (latent_dim ~= 512, not hidden_size 800)
+# and (b) it is absent for grover_base / KermtTask checkpoints.
+PROJECTED_EMBEDDING_TYPE = "projected"
+
 
 def load_embeddings(
     embeddings_path: str,
@@ -45,14 +51,18 @@ def load_embeddings(
     
     # Case 1: Directory with multiple .npy files (new format from extract_embeddings.py)
     if path.is_dir():
-        # Check for the 4 embedding files
+        # Check for the 4 encoder readout files plus optional projected.npy
         available_types = []
         for etype in EMBEDDING_TYPES:
             if (path / f"{etype}.npy").exists():
                 available_types.append(etype)
-        
-        if not available_types:
-            raise ValueError(f"No embedding files found in {path}. Expected: {EMBEDDING_TYPES}")
+        has_projected = (path / f"{PROJECTED_EMBEDDING_TYPE}.npy").exists()
+
+        if not available_types and not has_projected:
+            raise ValueError(
+                f"No embedding files found in {path}. Expected at least one of "
+                f"{EMBEDDING_TYPES + [PROJECTED_EMBEDDING_TYPE]}."
+            )
         
         # Load metadata if available
         metadata = None
@@ -67,7 +77,19 @@ def load_embeddings(
                 raise ValueError(f"Embedding type '{embedding_type}' not found. Available: {available_types}")
             embeddings = np.load(path / f"{embedding_type}.npy")
             print(f"  Loaded {embedding_type} embeddings: {embeddings.shape}")
-        
+
+        elif embedding_type == PROJECTED_EMBEDDING_TYPE:
+            proj_path = path / f"{PROJECTED_EMBEDDING_TYPE}.npy"
+            if not proj_path.exists():
+                raise ValueError(
+                    f"'{PROJECTED_EMBEDDING_TYPE}.npy' not found in {path}. "
+                    "Only cMIM and Hybrid checkpoints produce a projected latent — "
+                    "re-run extract_embeddings.py with --projection on those models, "
+                    "or skip this readout for grover_base / KermtTask checkpoints."
+                )
+            embeddings = np.load(proj_path)
+            print(f"  Loaded projected embeddings: {embeddings.shape}")
+
         elif embedding_type == "concat":
             # Concatenate all available types
             emb_list = []
@@ -89,7 +111,7 @@ def load_embeddings(
         else:
             raise ValueError(
                 f"Unknown embedding_type: {embedding_type}. "
-                f"Options: {EMBEDDING_TYPES + ['concat', 'mean']}"
+                f"Options: {EMBEDDING_TYPES + ['concat', 'mean', PROJECTED_EMBEDDING_TYPE]}"
             )
         
         return embeddings, metadata

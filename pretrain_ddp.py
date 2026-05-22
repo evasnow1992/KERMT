@@ -445,8 +445,8 @@ def main(rank: int, world_size: int):
         if args.atom_vocab_path is None or args.bond_vocab_path is None:
             raise ValueError(
                 "Hybrid training (--pretrain_mode hybrid) requires --atom_vocab_path and --bond_vocab_path\n"
-                "Example: --atom_vocab_path path/to/pretrain_atom_vocab.pkl "
-                "--bond_vocab_path path/to/pretrain_bond_vocab.pkl"
+                "Example: --atom_vocab_path path/to/pretrain_atom_vocab.json "
+                "--bond_vocab_path path/to/pretrain_bond_vocab.json"
             )
         if rank == 0:
             print("[INFO] Hybrid mode: Loading all vocabularies")
@@ -537,8 +537,8 @@ def main(rank: int, world_size: int):
         if args.atom_vocab_path is None or args.bond_vocab_path is None:
             raise ValueError(
                 "Vocab-based pretraining (--pretrain_mode vocab) requires --atom_vocab_path and --bond_vocab_path\n"
-                "Example: --atom_vocab_path path/to/pretrain_atom_vocab.pkl "
-                "--bond_vocab_path path/to/pretrain_bond_vocab.pkl"
+                "Example: --atom_vocab_path path/to/pretrain_atom_vocab.json "
+                "--bond_vocab_path path/to/pretrain_bond_vocab.json"
             )
         if rank == 0:
             print("[INFO] Vocab-based mode: Loading atom and bond vocabularies")

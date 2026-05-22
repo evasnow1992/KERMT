@@ -37,6 +37,7 @@
 """
 The parsing functions for the argument input.
 """
+import json
 import os
 import pickle
 from argparse import ArgumentParser, Namespace
@@ -333,7 +334,7 @@ def add_pretrain_args(parser: ArgumentParser):
     parser.add_argument('--max_cached_files', type=int, default=100,
                         help='Maximum number of data files to keep in memory (LRU cache). '
                              'Used for lazy_loading mode and memory-mapped SMILES cache. '
-                             'For large datasets (e.g., ZINC15_up with 417 files), set to 500+ '
+                             'For large datasets (e.g., ZINC15 200M with 417 files), set to 500+ '
                              'to cache all SMILES and avoid CSV parsing during training. '
                              'Default: 100 files.')
     
@@ -636,8 +637,14 @@ def modify_train_args(args: Namespace):
     assert (args.split_type == 'crossval') == (args.crossval_index_dir is not None)
     assert (args.split_type in ['crossval', 'index_predetermined']) == (args.crossval_index_file is not None)
     if args.split_type in ['crossval', 'index_predetermined']:
-        with open(args.crossval_index_file, 'rb') as rf:
-            args.crossval_index_sets = pickle.load(rf)
+        # Default is JSON (secure). Explicit ``.pkl`` / ``.pckl`` opts into pickle
+        # so older on-disk crossval index files can still be loaded if encountered.
+        if args.crossval_index_file.endswith(('.pkl', '.pckl')):
+            with open(args.crossval_index_file, 'rb') as rf:
+                args.crossval_index_sets = pickle.load(rf)
+        else:
+            with open(args.crossval_index_file, 'r') as rf:
+                args.crossval_index_sets = json.load(rf)
         args.num_folds = len(args.crossval_index_sets)
         args.seed = 0
 

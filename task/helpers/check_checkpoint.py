@@ -3,15 +3,17 @@
 Inspect a pretrain or finetune checkpoint and print training status.
 
 Usage:
-    python task/check_checkpoint.py path/to/last_checkpoint.pt
-    python task/check_checkpoint.py path/to/last_checkpoint.pt --show_model_size
+    python task/helpers/check_checkpoint.py path/to/last_checkpoint.pt
+    python task/helpers/check_checkpoint.py path/to/last_checkpoint.pt --show_model_size
 
-With --show_model_size, vocab pickles are resolved in order:
+With --show_model_size, vocab files are resolved in order:
   1) explicit --smiles_vocab_path / --atom_vocab_path / --bond_vocab_path
-  2) same directory as the checkpoint: pretrain_smiles_vocab.pkl, pretrain_atom_vocab.pkl,
-     pretrain_bond_vocab.pkl
+  2) same directory as the checkpoint:
+       pretrain_smiles_vocab.pkl (always pickle),
+       pretrain_atom_vocab.json (then .pkl fallback),
+       pretrain_bond_vocab.json (then .pkl fallback)
   3) path stored in the checkpoint (if that file exists)
-  4) interactive prompt (unless --non_interactive)
+  4) interactive prompt (unless --non-interactive)
 """
 import argparse
 import copy
@@ -20,18 +22,21 @@ import sys
 from collections import OrderedDict
 from datetime import datetime
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import torch
 
 
-# Default filenames when vocabs sit next to last_checkpoint.pt
-_VOCAB_BASENAME = {
-    "smiles_vocab_path": "pretrain_smiles_vocab.pkl",
-    "atom_vocab_path": "pretrain_atom_vocab.pkl",
-    "bond_vocab_path": "pretrain_bond_vocab.pkl",
+# Default filenames when vocabs sit next to last_checkpoint.pt.
+# Atom/bond vocabs default to JSON (the post-2026-05-08 convention); pickle is
+# still tried as a fallback so older checkpoints can be inspected. SMILES vocab
+# is always pickle — its compiled regex state is not JSON-serializable.
+_VOCAB_BASENAMES = {
+    "smiles_vocab_path": ("pretrain_smiles_vocab.pkl",),
+    "atom_vocab_path": ("pretrain_atom_vocab.json", "pretrain_atom_vocab.pkl"),
+    "bond_vocab_path": ("pretrain_bond_vocab.json", "pretrain_bond_vocab.pkl"),
 }
 
 
@@ -70,18 +75,24 @@ def _report_state_dict_load(result, label):
 
 
 def _infer_pretrain_mode(state_dict):
-    """Infer vocab / cmim / hybrid from weight keys when args.pretrain_mode is absent (older checkpoints)."""
+    """Infer pretrain layout from weight keys when args.pretrain_mode is absent."""
     if not state_dict:
         return None
     keys = list(state_dict.keys())
     has_latent = any(k.startswith("latent_dist.") for k in keys)
     has_vocab_mod = any(k.startswith("vocab_module.") for k in keys)
+    has_kermt = any(k.startswith("kermt.") for k in keys)
+    has_grover = any(k.startswith("grover.") for k in keys)
     if has_latent and has_vocab_mod:
         return "hybrid"
     if has_latent:
         return "cmim"
-    if has_vocab_mod or any(k.startswith("kermt.") for k in keys):
+    if has_vocab_mod:
         return "vocab"
+    # Legacy GROVER release: encoder-only weights under grover.* (no kermt rename yet).
+    # Or a bare kermt.* export without vocab / CMIM heads.
+    if has_grover or has_kermt:
+        return "embedding_only"
     return None
 
 
@@ -109,6 +120,22 @@ def _args_for_model_build(stored_args):
         a.decoder_gate_self_attn = False
     if not hasattr(a, "decoder_gate_cross_attn"):
         a.decoder_gate_cross_attn = False
+    if not hasattr(a, "dist_coff"):
+        a.dist_coff = 0.1
+    # Minimal encoder / vocab pretrain fields (legacy grover_base.pt args are often sparse)
+    for key, val in (
+        ("dropout", 0.1),
+        ("num_attn_head", 4),
+        ("atom_message", False),
+        ("bond_drop_rate", 0.0),
+        ("nencoders", 3),
+        ("coord", 15),
+        ("input_layer", "fc"),
+        ("no_attach_fea", False),
+        ("use_cuikmolmaker_featurization", False),
+    ):
+        if not hasattr(a, key):
+            setattr(a, key, val)
     return a
 
 
@@ -130,11 +157,11 @@ def resolve_vocab_path(label, checkpoint_dir, stored_path, override, interactive
             return override
         raise FileNotFoundError(f"{label} override not found: {override}")
 
-    basename = _VOCAB_BASENAME[label]
-    next_to = os.path.join(checkpoint_dir, basename)
-    if os.path.isfile(next_to):
-        print(f"  [INFO] {label}: using {next_to}")
-        return next_to
+    for basename in _VOCAB_BASENAMES[label]:
+        next_to = os.path.join(checkpoint_dir, basename)
+        if os.path.isfile(next_to):
+            print(f"  [INFO] {label}: using {next_to}")
+            return next_to
 
     if stored_path and os.path.isfile(stored_path):
         print(f"  [INFO] {label}: using checkpoint-recorded path {stored_path}")
@@ -159,7 +186,7 @@ def resolve_vocab_path(label, checkpoint_dir, stored_path, override, interactive
 def _print_pretrain_model_size(
     stored_args, state_dict, checkpoint_dir, vocab_overrides, interactive, mode
 ):
-    from task.kermt_model_size_report import (
+    from task.helpers.kermt_model_size_report import (
         create_cmim_model,
         create_hybrid_model,
         create_vocab_model,
@@ -241,8 +268,62 @@ def _print_pretrain_model_size(
         bond_vocab_size = load_vocab(bp)
         model, ma = create_vocab_model(copy.copy(a), atom_vocab_size, bond_vocab_size, fg_size)
         if sd is not None:
-            _report_state_dict_load(model.load_state_dict(sd, strict=False), "vocab")
+            sd_load = OrderedDict(sd)
+            if any(k.startswith("grover.") for k in sd_load.keys()):
+                sd_load = OrderedDict(
+                    (k.replace("grover", "kermt"), v) for k, v in sd_load.items()
+                )
+            _report_state_dict_load(model.load_state_dict(sd_load, strict=False), "vocab")
         print_model_info_vocab(model, ma, atom_vocab_size, bond_vocab_size, fg_size)
+
+
+def _ensure_encoder_args_for_embedding_only(a):
+    """Fill fields KERMTEmbedding may need when args come from a minimal grover_base checkpoint."""
+    enc_defaults = {
+        "num_attn_head": 4,
+        "dropout": 0.1,
+        "atom_message": False,
+        "bond_drop_rate": 0.0,
+        "nencoders": 3,
+        "coord": 15,
+        "input_layer": "fc",
+        "no_attach_fea": False,
+        "use_cuikmolmaker_featurization": False,
+    }
+    for key, val in enc_defaults.items():
+        if not hasattr(a, key):
+            setattr(a, key, val)
+
+
+def _print_embedding_only_model_size(stored_args, state_dict):
+    """Encoder-only checkpoint (e.g. grover_base.pt with grover.* keys)."""
+    from kermt.model.models import KERMTEmbedding
+    from task.helpers.kermt_model_size_report import print_model_info_embedding_only
+
+    a = _args_for_model_build(stored_args)
+    _ensure_encoder_args_for_embedding_only(a)
+    a.embedding_output_type = "both"
+    a.cuda = False
+
+    sd = _maybe_strip_ddp_prefix(state_dict)
+    sd = OrderedDict((k.replace("grover", "kermt"), v) for k, v in sd.items())
+    if any("latent_dist." in k for k in sd.keys()):
+        sd = OrderedDict((k.replace("latent_dist.", ""), v) for k, v in sd.items())
+
+    encoder = KERMTEmbedding(a)
+    encoder_sd = {}
+    for key, value in sd.items():
+        if key.startswith("kermt."):
+            encoder_sd[key[len("kermt.") :]] = value
+
+    if not encoder_sd:
+        raise ValueError(
+            "embedding_only: no kermt.* (or grover.*) weights after key transform; "
+            f"sample keys: {list(sd.keys())[:8]}"
+        )
+
+    _report_state_dict_load(encoder.load_state_dict(encoder_sd, strict=False), "KERMTEmbedding")
+    print_model_info_embedding_only(encoder, a)
 
 
 def _print_finetune_model_size(stored_args, state_dict=None):
@@ -282,17 +363,50 @@ def _print_model_size_from_checkpoint(ckpt, checkpoint_path, vocab_overrides, in
     mode = getattr(stored, "pretrain_mode", None)
     if isinstance(stored, dict):
         mode = stored.get("pretrain_mode", mode)
-    if mode not in ("vocab", "cmim", "hybrid"):
+    if mode not in ("vocab", "cmim", "hybrid", "embedding_only"):
         mode = _infer_pretrain_mode(state_dict)
-    if mode not in ("vocab", "cmim", "hybrid"):
+    if mode not in ("vocab", "cmim", "hybrid", "embedding_only"):
         raise ValueError(
             "Could not determine pretrain_mode from args or state_dict keys; "
-            "expected hybrid (latent_dist + vocab_module), cmim (latent_dist only), "
-            "or vocab (vocab_module / kermt)."
+            "expected hybrid, cmim, vocab (vocab_module), or embedding_only (grover.*/kermt.* encoder only)."
         )
+
+    checkpoint_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+    vo = vocab_overrides or {}
+    upgraded_encoder_to_vocab = False
+    # Legacy GROVER encoder release: file has grover.* only. Former print_model_size.py --mode vocab
+    # reported full KermtTask (encoder + vocab heads) using atom/bond pickle sizes — match that when
+    # we can resolve those vocabs.
+    if mode == "embedding_only":
+        tmp_a = _args_for_model_build(stored)
+        try:
+            resolve_vocab_path(
+                "atom_vocab_path",
+                checkpoint_dir,
+                getattr(tmp_a, "atom_vocab_path", None),
+                vo.get("atom_vocab_path"),
+                interactive,
+            )
+            resolve_vocab_path(
+                "bond_vocab_path",
+                checkpoint_dir,
+                getattr(tmp_a, "bond_vocab_path", None),
+                vo.get("bond_vocab_path"),
+                interactive,
+            )
+            mode = "vocab"
+            upgraded_encoder_to_vocab = True
+        except FileNotFoundError:
+            pass
+
     if not isinstance(stored, dict):
         stored_mode = getattr(stored, "pretrain_mode", None)
-        if stored_mode != mode:
+        if upgraded_encoder_to_vocab:
+            print(
+                "  [INFO] Encoder-only weights (legacy grover./kermt. keys); atom/bond vocabs resolved. "
+                "Reporting full KermtTask size (encoder + vocab heads), same as former print_model_size.py --mode vocab."
+            )
+        elif stored_mode != mode:
             print(
                 f"  [INFO] Inferred pretrain_mode={mode!r} from state_dict "
                 f"(checkpoint args had {stored_mode!r})."
@@ -302,12 +416,14 @@ def _print_model_size_from_checkpoint(ckpt, checkpoint_path, vocab_overrides, in
     print("MODEL SIZE")
     print("-" * 80)
 
-    checkpoint_dir = os.path.dirname(os.path.abspath(checkpoint_path))
-
     if mode in ("vocab", "cmim", "hybrid"):
         _print_pretrain_model_size(
             stored, state_dict, checkpoint_dir, vocab_overrides, interactive, mode
         )
+        return
+
+    if mode == "embedding_only":
+        _print_embedding_only_model_size(stored, state_dict)
         return
 
     try:
@@ -558,7 +674,7 @@ def main():
     parser.add_argument(
         "--show_model_size",
         action="store_true",
-        help="Rebuild model from checkpoint args; print parameter report (task/kermt_model_size_report.py)",
+        help="Rebuild model from checkpoint args; print parameter report (task/helpers/kermt_model_size_report.py)",
     )
     parser.add_argument(
         "--non-interactive",

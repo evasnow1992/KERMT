@@ -11,7 +11,7 @@ we concatenate atom_from_atom and atom_from_bond to get a single
 by the finetune FFN input).
 
 Example (run inside container with KERMT environment):
-    python task/embed_sampled_datasets_kermt.py \
+    python task/helpers/embed_sampled_datasets_kermt.py \
         --input /path/to/sampled_datasets.csv \
         --output /path/to/embeddings_kermt.pkl \
         --checkpoint /models/last_checkpoint.pt \
@@ -20,14 +20,20 @@ Example (run inside container with KERMT environment):
 
 import argparse
 import csv
+import os
 import pickle
+import sys
 import time
 from pathlib import Path
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
 import torch
 
-from task.extract_embeddings import (
+from task.extract_embeddings import (  # noqa: E402
     load_encoder_from_checkpoint,
     extract_all_embeddings,
 )

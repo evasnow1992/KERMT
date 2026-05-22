@@ -11,7 +11,7 @@ def test_frozen_encoder(finetune_args):
 
 
     args = finetune_args
-    args.checkpoint_paths = "/home/sveccham/GNN/GROVER/models/models_from_paper/grover_base.pt"
+    args.checkpoint_paths = "reference_pretrained_models/grover_base.pt"
     
     # Freeze the encoder parameters
     args.fine_tune_coff = 0.0

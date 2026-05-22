@@ -1,6 +1,7 @@
 """
 The contextual property.
 """
+import json
 import pickle
 import re
 import os
@@ -94,14 +95,61 @@ class TorchVocab(object):
             seq = [self.stoi.get(bond_to_vocab(mol, bond), self.other_index) for i, bond in enumerate(mol.GetBonds())]
         return (seq, len(seq)) if with_len else seq
 
-    @staticmethod
-    def load_vocab(vocab_path: str) -> 'TorchVocab':
-        with open(vocab_path, "rb") as f:
-            return pickle.load(f)
+    def to_dict(self):
+        """Serialize this vocab to a JSON-safe dict.
+
+        Note: subclasses that add non-JSON-safe state (e.g., compiled regex in
+        :class:`SMILESVocab`) should either override save/load to stay on the
+        pickle path or extend this method to include their state explicitly.
+        """
+        return {
+            'freqs': dict(self.freqs),
+            'itos': self.itos,
+            'stoi': self.stoi,
+            'vocab_type': self.vocab_type,
+            'other_index': self.other_index,
+            'pad_index': self.pad_index,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        """Reconstruct a vocab from the dict produced by :meth:`to_dict`."""
+        vocab = object.__new__(cls)
+        vocab.freqs = Counter(d['freqs'])
+        vocab.itos = d['itos']
+        vocab.stoi = d['stoi']
+        vocab.vocab_type = d['vocab_type']
+        vocab.other_index = d['other_index']
+        vocab.pad_index = d['pad_index']
+        return vocab
+
+    @classmethod
+    def load_vocab(cls, vocab_path: str) -> 'TorchVocab':
+        """Load a vocab, auto-detecting format from the file extension.
+
+        Default is JSON (secure, no arbitrary-code-execution risk). Pickle
+        is opt-in only by an explicit ``.pkl`` / ``.pckl`` extension, kept
+        so older on-disk vocab files can still be loaded if encountered.
+        """
+        if vocab_path.endswith(('.pkl', '.pckl')):
+            with open(vocab_path, "rb") as f:
+                return pickle.load(f)
+        with open(vocab_path, "r") as f:
+            return cls.from_dict(json.load(f))
 
     def save_vocab(self, vocab_path):
-        with open(vocab_path, "wb") as f:
-            pickle.dump(self, f)
+        """Save a vocab, format chosen from the file extension.
+
+        Default is JSON; ``.pkl`` / ``.pckl`` extensions opt into pickle
+        (kept only for callers that explicitly need to interop with older
+        pickle-only consumers).
+        """
+        if vocab_path.endswith(('.pkl', '.pckl')):
+            with open(vocab_path, "wb") as f:
+                pickle.dump(self, f)
+            return
+        with open(vocab_path, "w") as f:
+            json.dump(self.to_dict(), f)
 
 
 class MolVocab(TorchVocab):
@@ -198,10 +246,17 @@ class MolVocab(TorchVocab):
         # print("end")
         return sub_counter
 
-    @staticmethod
-    def load_vocab(vocab_path: str) -> 'MolVocab':
-        with open(vocab_path, "rb") as f:
-            return pickle.load(f)
+    @classmethod
+    def load_vocab(cls, vocab_path: str) -> 'MolVocab':
+        """Load a MolVocab. Defaults to JSON; ``.pkl`` / ``.pckl`` opts into pickle.
+
+        See :meth:`TorchVocab.load_vocab` for the extension convention.
+        """
+        if vocab_path.endswith(('.pkl', '.pckl')):
+            with open(vocab_path, "rb") as f:
+                return pickle.load(f)
+        with open(vocab_path, "r") as f:
+            return cls.from_dict(json.load(f))
 
 
 class SMILESVocab(TorchVocab):
@@ -392,6 +447,21 @@ class SMILESVocab(TorchVocab):
     
     @staticmethod
     def load_vocab(vocab_path: str) -> 'SMILESVocab':
-        """Load SMILES vocabulary from pickle file."""
+        """Load SMILES vocabulary from a pickle file.
+
+        SMILESVocab holds a compiled regex pattern that cannot be JSON-
+        serialized cleanly, so this class stays on the pickle path
+        regardless of file extension. Atom and bond MolVocab files default
+        to JSON; SMILESVocab files must be ``.pkl`` / ``.pckl``.
+        """
         with open(vocab_path, "rb") as f:
             return pickle.load(f)
+
+    def save_vocab(self, vocab_path):
+        """Save SMILES vocabulary to a pickle file.
+
+        Overrides the TorchVocab extension-based dispatch because the
+        compiled regex state is not JSON-serializable. Always pickles.
+        """
+        with open(vocab_path, "wb") as f:
+            pickle.dump(self, f)

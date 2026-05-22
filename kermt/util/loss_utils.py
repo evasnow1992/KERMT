@@ -1,8 +1,5 @@
 """
 Utility functions for loss computation and gradient normalization.
-
-Inspired by the gradient normalization approach from MIM-playground:
-https://gitlab-master.nvidia.com/bioml/mim-playground
 """
 
 import torch

@@ -1,7 +1,15 @@
-# KERMT
-A pretrained graph neural network model for molecular property prediction.
+<h1 align="center">KERMT</h1>
 
-**K**inetic GROV**ER** **M**ulti-**T**ask (KERMT) is an enhanced reimplementation of the [GROVER](https://arxiv.org/abs/2007.02835) model. The KERMT implementation uses PyTorch Distributed Data Parallel (DDP) for distributed pretraining,  automates hyperparameter tuning, and accelerates finetuning and prediction using [cuik-molmaker](https://github.com/NVIDIA-Digital-Bio/cuik-molmaker).
+This is the official code repository for the paper titled [Multitask finetuning and acceleration of chemical pretrained models for small molecule drug property prediction](https://arxiv.org/abs/2510.12719).
+
+<p align="center">
+    <img width="750" src="figures/concept.png"/>
+</p>
+
+
+**K**inetic GROV**ER** **M**ulti-**T**ask (KERMT) is a pretrained graph neural network model for molecular property prediction.
+
+KERMT is an enhanced reimplementation of the [GROVER](https://arxiv.org/abs/2007.02835) model. The KERMT implementation uses PyTorch Distributed Data Parallel (DDP) for distributed pretraining,  automates hyperparameter tuning, and accelerates finetuning and prediction using [cuik-molmaker](https://github.com/NVIDIA-Digital-Bio/cuik-molmaker).
 
 This implementation is based on the [original GROVER implementation](https://github.com/tencent-ailab/grover) and [paper](https://arxiv.org/abs/2007.02835).
 
@@ -37,7 +45,7 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8 # for deterministic results
 
 #### [Alternative to Docker container] Install conda environment from file
 ```bash
-# Create conda environment
+# Create conda environment (includes cuik-molmaker)
 cd KERMT
 conda env create -n kermt -f environment.yml
 conda activate kermt
@@ -66,7 +74,7 @@ python scripts/build_vocab.py --data_path tests/data/smis_only.csv  \
                               --vocab_save_folder tests/data/smis_only  \
                               --dataset_name smis_only
  ```
-The outputs of this script are vocabulary dicts of atoms and bonds, `smis_only_atom_vocab.pkl` and `smis_only_bond_vocab.pkl`, respectively. For more options for contextual property extraction, please refer to `scripts/build_vocab.py`.
+The outputs of this script are vocabulary dicts of atoms and bonds, `smis_only_atom_vocab.json` and `smis_only_bond_vocab.json`, respectively (JSON is the default; pass `--vocab_format pkl` for pickle output). For more options for contextual property extraction, please refer to `scripts/build_vocab.py`.
 
 #### Data Splitting
 Split pretraining data and features into smaller files for memory efficiency.
@@ -87,27 +95,27 @@ smis_only
 ```
 
 #### Running Pretraining
-For pretraining on multiple GPUs, set available number of GPUs as `WORLD_SIZE`. As pretraining datasets are large, it is recommended to use a large batch size and ensure near-full GPU memory utilization for maximum efficiency.
+For pretraining on multiple GPUs, set available number of GPUs as `WORLD_SIZE`. As pretraining datasets are large, it is recommended to use a large batch size and ensure near-full GPU memory utilization for maximum efficiency. This example shows how to pretrain on 2 GPUs on a prepared pretraining dataset in the `tests/data/pretrain` directory.
 ```bash
 WORLD_SIZE=2 python pretrain_ddp.py  \
-    --train_data_path tests/data/smis_only/train_9k \
-    --val_data_path tests/data/smis_only/val_1k \
+    --train_data_path tests/data/pretrain/train_9k \
+    --val_data_path tests/data/pretrain/val_1k \
     --save_dir model/pretrain \
-    --atom_vocab_path tests/data/smis_only/smis_only_atom_vocab.pkl \
-    --bond_vocab_path tests/data/smis_only/smis_only_bond_vocab.pkl \
+    --atom_vocab_path tests/data/pretrain/pretrain_atom_vocab.json \
+    --bond_vocab_path tests/data/pretrain/pretrain_bond_vocab.json \
     --batch_size 256   --dropout 0.1 --depth 6 --num_attn_head 4 --hidden_size 800 \
     --epochs 100 --init_lr 1E-5 --max_lr 1.5E-4 --final_lr 1E-5 --warmup_epochs 20 \
     --weight_decay 1E-7 --activation PReLU --backbone gtrans --embedding_output_type \
     both  --tensorboard --save_interval 100 --use_cuikmolmaker_featurization
 ```
-
+For preparing your own pretraining dataset, please run the [Data Preparation](#data-preparation), [vocabulary generation](#atombond-contextual-property-vocabulary), and [data splitting](#data-splitting) sections above.
 
 ## Finetuning
-The finetune dataset should be organized into three `.csv` files for train, validation, and test sets. Each of the `.csv` files should contain a column named as `smiles` and columns for prediction tasks. See `tests/data/finetune/` for examples.
+The dataset for finetuning should be organized into three `.csv` files for train, validation, and test sets. Each of the `.csv` files should contain a column named as `smiles` and columns for prediction tasks. See `tests/data/finetune/` for examples.
 
 
 #### (Optional) Molecular feature extraction
-Given a labelled molecular dataset, it is possible to precompute additional molecular features required to finetune the model from the existing pretrained model. The feature matrix is stored as `.npz`. This examples shows how to precompute normalized RDKit 2D features.
+Given a labelled molecular dataset, it is possible to precompute additional molecular features required to finetune the model from the existing pretrained model. The feature matrix is stored as `.npz`. This examples shows how to precompute normalized RDKit 2D features for training dataset. This step should be repeated for validation and test datasets.
 ``` bash
 python scripts/save_features.py --data_path tests/data/finetune/train.csv \
                                 --save_path tests/data/finetune/train.npz \
@@ -178,6 +186,7 @@ python main.py predict \
     --data_path tests/data/finetune/test.csv \
     --checkpoint_dir path/to/finetuned_model/ \
     --no_features_scaling \
+    --features_generator rdkit_2d_normalized_cuik_molmaker \
     --output path/to/predictions.csv
 ```
 
@@ -186,7 +195,9 @@ python main.py predict \
 
 
 ## References
+- Paper:[Multitask finetuning and acceleration of chemical
+pretrained models for small molecule drug
+property prediction](https://arxiv.org/abs/2510.12719)
+- Dataset: [Figshare link](https://figshare.com/articles/dataset/Datasets_for_Multitask_finetuning_and_acceleration_of_chemical_pretrained_models_for_small_molecule_drug_property_prediction_/30350548/2)
 - [Original GROVER paper](https://arxiv.org/abs/2007.02835)
 - [Original GROVER implementation](https://github.com/tencent-ailab/grover)
-- New paper: Coming soon!
-- New dataset: Coming soon!

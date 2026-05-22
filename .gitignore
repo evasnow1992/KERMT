@@ -137,3 +137,10 @@ dmypy.json
 
 # created pickles
 exampledata/finetune/*.npz
+
+# Local-only datasets and trained models (not intended for upstream)
+model/
+tests/data/Biogen_for_grover/
+tests/data/ChEMBL_MT/
+tests/data/ZINC15_ChEMBL/
+tests/data/openadmet/

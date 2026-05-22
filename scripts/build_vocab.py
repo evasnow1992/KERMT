@@ -51,7 +51,15 @@ def parse_args():
                         help="Path to the folder where the vocab files will be saved")
     parser.add_argument('--dataset_name', type=str, default=None,
                         help="Prefix for vocab file names. If None, files will be: "
-                             "atom_vocab.pkl, bond_vocab.pkl, smiles_vocab.pkl")
+                             "atom_vocab.json, bond_vocab.json, smiles_vocab.pkl "
+                             "(SMILES vocab is always pickle; see --vocab_format).")
+    parser.add_argument('--vocab_format', type=str, default='json', choices=['json', 'pkl'],
+                        help="Output format for the atom and bond vocab files. "
+                             "Default 'json' uses secure JSON serialization (no arbitrary "
+                             "code execution on load). 'pkl' opts back into pickle for "
+                             "callers that explicitly need to interop with older consumers. "
+                             "The SMILES vocab is always pickle (compiled regex state is "
+                             "not JSON-serializable).")
     parser.add_argument('--num_workers', type=int, default=100,
                         help="Number of workers for parallel processing")
     
@@ -119,7 +127,7 @@ def build(args):
         print()
         
         for vocab_type in ['atom', 'bond']:
-            vocab_file = f"{vocab_type}_vocab.pkl"
+            vocab_file = f"{vocab_type}_vocab.{args.vocab_format}"
             if args.dataset_name is not None:
                 vocab_file = args.dataset_name + '_' + vocab_file
             vocab_save_path = os.path.join(args.vocab_save_folder, vocab_file)

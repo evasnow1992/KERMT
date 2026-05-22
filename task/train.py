@@ -40,7 +40,8 @@ The training function used in the finetuning task.
 import csv
 import logging
 import os
-import pickle
+import json
+import pickle  # noqa: F401  (kept; available if a caller wants to load legacy .pckl splits)
 import time
 from argparse import Namespace
 from logging import Logger
@@ -649,6 +650,6 @@ def save_splits(args, test_data, train_data, val_data):
             split_indices.append(indices_by_smiles[smiles])
             split_indices = sorted(split_indices)
         all_split_indices.append(split_indices)
-    with open(os.path.join(args.save_dir, 'split_indices.pckl'), 'wb') as f:
-        pickle.dump(all_split_indices, f)
+    with open(os.path.join(args.save_dir, 'split_indices.json'), 'w') as f:
+        json.dump(all_split_indices, f)
     return writer

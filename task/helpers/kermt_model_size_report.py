@@ -2,13 +2,13 @@
 """
 Shared helpers to build KERMT pretrain models and print parameter breakdowns.
 
-Used by task/check_checkpoint.py --show_model_size (checkpoint args + vocab pickles).
+Used by task/helpers/check_checkpoint.py --show_model_size (checkpoint args + vocab pickles).
 """
 import os
 import pickle
 import sys
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
@@ -337,6 +337,40 @@ def print_model_info_hybrid(
     for component, count in component_params.items():
         percentage = (count / total_params) * 100
         print(f"  {component:50s}: {count:12,} ({format_size(count):>8s}) [{percentage:5.1f}%]")
+    param_size_mb = (total_params * 4) / (1024**2)
+    print("\nApproximate Model Size:")
+    print(f"  FP32: {param_size_mb:.2f} MB")
+    print(f"  FP16: {param_size_mb / 2:.2f} MB")
+    print("=" * 70 + "\n")
+
+
+def print_model_info_embedding_only(model, args):
+    """Report size for KERMTEmbedding-only weights (legacy grover.* checkpoints)."""
+    print("\n" + "=" * 70)
+    print("KERMTEmbedding ONLY (encoder / legacy GROVER-style checkpoint)")
+    print("=" * 70)
+    print("\n  No vocab heads or CMIM decoder in this file; counts are for the graph encoder only.")
+    print("\nModel Configuration:")
+    print("  Encoder (GROVER / GTrans):")
+    print(f"    Hidden Size:        {args.hidden_size}")
+    print(f"    Depth (Layers):     {args.depth}")
+    print(f"    Attention Heads:    {args.num_attn_head}")
+    print(f"    MT Blocks:          {args.num_mt_block}")
+    print(f"    Activation:         {args.activation}")
+    print(f"    Dropout:            {args.dropout}")
+    print(f"    Readout:            {'Self-Attention' if args.self_attention else 'Mean'}")
+    if args.self_attention:
+        print(f"      Attn Hidden:      {args.attn_hidden}")
+        print(f"      Attn Out:         {args.attn_out}")
+    total_params, trainable_params = count_parameters(model)
+    print("\nParameter Count:")
+    print(f"  Total Parameters:      {total_params:,} ({format_size(total_params)})")
+    print(f"  Trainable Parameters:  {trainable_params:,} ({format_size(trainable_params)})")
+    print("\nParameter Breakdown by Submodule:")
+    for name, child in model.named_children():
+        n = sum(p.numel() for p in child.parameters())
+        pct = (100.0 * n / total_params) if total_params else 0.0
+        print(f"  {name:20s}: {n:12,} ({format_size(n):>8s}) [{pct:5.1f}%]")
     param_size_mb = (total_params * 4) / (1024**2)
     print("\nApproximate Model Size:")
     print(f"  FP32: {param_size_mb:.2f} MB")

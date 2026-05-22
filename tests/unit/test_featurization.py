@@ -26,7 +26,7 @@ import pytest
 import torch
 import pandas as pd
 from argparse import Namespace
-from kermt.data.molgraph import mol2graph
+from kermt.data.molgraph import MolGraph, mol2graph
 from kermt.util.features import get_feature_range
 
 import cuik_molmaker
@@ -35,23 +35,23 @@ import cuik_molmaker
 def test_cuik_molmaker_featurization(bond_drop_rate: float):
     smis = pd.read_csv('tests/data/smis.csv')['smiles'].tolist()
 
-    # Form feature tensors for cuik-molmaker
-    cmm_feature_tensors = {}
+    # Form feature arrays for cuik-molmaker
+    cmm_feature_arrays = {}
     atom_onehot_props = ["atomic-number", "total-degree", "formal-charge", "chirality",
                         "num-hydrogens", "hybridization",
                         "implicit-valence", 
                         "ring-size",
                         ]
 
-    cmm_feature_tensors["atom_onehot"] = cuik_molmaker.atom_onehot_feature_names_to_tensor(atom_onehot_props)
+    cmm_feature_arrays["atom_onehot"] = cuik_molmaker.atom_onehot_feature_names_to_array(atom_onehot_props)
     atom_float_props = ["aromatic", "mass", 
                         "hydrogen-bond-acceptor",
                             "hydrogen-bond-donor", 
                             "acidic", "basic"
                             ]
-    cmm_feature_tensors["atom_float"] = cuik_molmaker.atom_float_feature_names_to_tensor(atom_float_props)
+    cmm_feature_arrays["atom_float"] = cuik_molmaker.atom_float_feature_names_to_array(atom_float_props)
     bond_props = ["is-null", "bond-type-onehot", "conjugated", "in-ring", "stereo"]
-    cmm_feature_tensors["bond"] = cuik_molmaker.bond_feature_names_to_tensor(bond_props)
+    cmm_feature_arrays["bond"] = cuik_molmaker.bond_feature_names_to_array(bond_props)
 
     # Get feature ranges for cuik-molmaker
     cmm_feature_range = get_feature_range(atom_onehot_props, atom_float_props)
@@ -63,7 +63,7 @@ def test_cuik_molmaker_featurization(bond_drop_rate: float):
 
     batch_mol_graph = mol2graph(smis, shared_dict, mol2graph_args, set_seed=True,
                                 cmm_feature_range=cmm_feature_range,
-                                cmm_tensors=cmm_feature_tensors,
+                                cmm_tensors=cmm_feature_arrays,
     )
 
     batch_mol_graph_ref = torch.load(f'tests/data/batch_mol_graph_bond_drop_rate_{bond_drop_rate}.pt')
@@ -78,3 +78,10 @@ def test_cuik_molmaker_featurization(bond_drop_rate: float):
     assert torch.allclose(a_scope, batch_mol_graph_ref['a_scope']), f"a_scope are not equal"
     assert torch.allclose(b_scope, batch_mol_graph_ref['b_scope']), f"b_scope are not equal"
     assert torch.allclose(a2a, batch_mol_graph_ref['a2a']), f"a2a are not equal"
+
+
+def test_molgraph_invalid_smiles_raises_valueerror():
+    """MolGraph should raise ValueError on invalid SMILES."""
+    args = Namespace(use_cuikmolmaker_featurization=False, bond_drop_rate=0.0)
+    with pytest.raises(ValueError, match="Invalid SMILES"):
+        MolGraph("not_a_valid_smiles", args=args)
