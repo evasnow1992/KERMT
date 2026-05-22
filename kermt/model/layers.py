@@ -1056,9 +1056,18 @@ class RoPETransformerDecoderLayer(nn.Module):
     
     This layer replaces PyTorch's standard TransformerDecoderLayer to integrate RoPE
     directly into the self-attention and cross-attention mechanisms.
+    
+    Optionally supports G1 gating (SDPA output gating) based on:
+    "Gated Attention: Improving Transformer with Gating Mechanisms"
+    G1 applies multiplicative sigmoid gating after multi-head attention concatenation,
+    before the output projection: Y' = Y ⊙ σ(X * Wθ)
+    
+    Gating can be independently enabled for self-attention and cross-attention
+    to allow ablation studies.
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, 
-                 dropout: float = 0.1, activation: str = 'relu', max_seq_len: int = 512):
+                 dropout: float = 0.1, activation: str = 'relu', max_seq_len: int = 512,
+                 gate_self_attn: bool = False, gate_cross_attn: bool = False):
         """
         :param d_model: embedding dimension
         :param nhead: number of attention heads
@@ -1066,12 +1075,16 @@ class RoPETransformerDecoderLayer(nn.Module):
         :param dropout: dropout rate
         :param activation: activation function ('relu' or 'gelu')
         :param max_seq_len: maximum sequence length for RoPE
+        :param gate_self_attn: whether to apply G1 gating to self-attention
+        :param gate_cross_attn: whether to apply G1 gating to cross-attention
         """
         super(RoPETransformerDecoderLayer, self).__init__()
         
         self.d_model = d_model
         self.nhead = nhead
         self.head_dim = d_model // nhead
+        self.gate_self_attn = gate_self_attn
+        self.gate_cross_attn = gate_cross_attn
         assert d_model % nhead == 0, "d_model must be divisible by nhead"
         
         # RoPE for positional encoding
@@ -1088,6 +1101,13 @@ class RoPETransformerDecoderLayer(nn.Module):
         self.cross_attn_k = nn.Linear(d_model, d_model)
         self.cross_attn_v = nn.Linear(d_model, d_model)
         self.cross_attn_out = nn.Linear(d_model, d_model)
+        
+        # G1 Gating: Applied after SDPA output (multi-head concatenation), before output projection
+        # Formula: Y' = Y ⊙ σ(X * Wθ), where Y=attn output, X=input, σ=sigmoid
+        if gate_self_attn:
+            self.self_attn_gate = nn.Linear(d_model, d_model)
+        if gate_cross_attn:
+            self.cross_attn_gate = nn.Linear(d_model, d_model)
         
         # Feedforward network
         self.linear1 = nn.Linear(d_model, dim_feedforward)
@@ -1174,7 +1194,7 @@ class RoPETransformerDecoderLayer(nn.Module):
                 tgt_key_padding_mask: torch.Tensor = None,
                 memory_key_padding_mask: torch.Tensor = None) -> torch.Tensor:
         """
-        Forward pass of decoder layer with RoPE.
+        Forward pass of decoder layer with RoPE and optional G1 gating.
         
         :param tgt: decoder input [B, L_tgt, D]
         :param memory: encoder output [B, L_mem, D]
@@ -1185,6 +1205,9 @@ class RoPETransformerDecoderLayer(nn.Module):
         :return: decoder layer output [B, L_tgt, D]
         """
         # Self-attention with RoPE
+        # Save original input for gating (X in the gating formula)
+        tgt_input = tgt
+        
         q = self.self_attn_q(tgt)
         k = self.self_attn_k(tgt)
         v = self.self_attn_v(tgt)
@@ -1195,11 +1218,21 @@ class RoPETransformerDecoderLayer(nn.Module):
             key_padding_mask=tgt_key_padding_mask,
             apply_rope=True  # Apply RoPE for self-attention
         )
+        
+        # Apply G1 gating to self-attention if enabled: Y' = Y ⊙ σ(X * Wθ)
+        # Y = attention output (tgt2), X = input (tgt_input), σ = sigmoid
+        if self.gate_self_attn:
+            gate = torch.sigmoid(self.self_attn_gate(tgt_input))
+            tgt2 = tgt2 * gate
+        
         tgt2 = self.self_attn_out(tgt2)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
         
         # Cross-attention (no RoPE - attending to encoder memory)
+        # Save input for gating
+        tgt_cross_input = tgt
+        
         q = self.cross_attn_q(tgt)
         k = self.cross_attn_k(memory)
         v = self.cross_attn_v(memory)
@@ -1210,6 +1243,12 @@ class RoPETransformerDecoderLayer(nn.Module):
             key_padding_mask=memory_key_padding_mask,
             apply_rope=False  # No RoPE for cross-attention
         )
+        
+        # Apply G1 gating to cross-attention if enabled
+        if self.gate_cross_attn:
+            gate = torch.sigmoid(self.cross_attn_gate(tgt_cross_input))
+            tgt2 = tgt2 * gate
+        
         tgt2 = self.cross_attn_out(tgt2)
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)

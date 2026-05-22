@@ -706,4 +706,308 @@ class KERMTCMIMTrainer:
         )
         self.n_steps = scheduler_step
         return epoch, scheduler_step, batch_idx
+
+
+class KERMTHybridTrainer:
+    """
+    Trainer for hybrid CMIM + vocabulary pretraining.
+    Combines contrastive learning, SMILES reconstruction, and vocab prediction objectives.
+    """
+    def __init__(self,
+                 args,
+                 model: Module,
+                 train_dataloader: DataLoader,
+                 val_dataloader: DataLoader,
+                 optimizer,
+                 scheduler,
+                 gpu_id,
+                 n_steps: int,
+                 logger: Logger = None):
+        """
+        The init function of KERMTHybridTrainer.
+        
+        :param args: the input arguments
+        :param model: the complete KermtHybridTask model
+        :param train_dataloader: the training dataloader
+        :param val_dataloader: the validation dataloader
+        :param optimizer: the optimizer
+        :param scheduler: the scheduler
+        :param gpu_id: the gpu id
+        :param n_steps: initial step count
+        :param logger: the logger
+        """
+        self.args = args
+        self.model = model
+        self.loss_func = self.model.get_loss_func(args)
+        self.gpu_id = gpu_id
+        self.train_dataloader = train_dataloader
+        self.val_dataloader = val_dataloader
+        self.debug = logger.debug if logger is not None else print
+
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+
+        self.n_iter = 0
+
+        self.model.to(self.gpu_id)
+        self.model = DDP(self.model, device_ids=[gpu_id])
+
+        if self.args.tensorboard:
+            self.writer = SummaryWriter(self.args.save_dir)
+
+        self.n_steps = n_steps
+        self.first_epoch_post_resume = True
+        self.curr_epoch_batch_idx = 0
+
+    def train(self, start_epoch: int, max_epochs: int) -> List:
+        """
+        The training iteration.
+        :param start_epoch: starting epoch number
+        :param max_epochs: the max epochs
+        :return: the loss terms of current epoch
+        """
+        for epoch in range(start_epoch, max_epochs):
+            s_time = time.time()
+            _, train_loss, _ = self.iter(epoch, train=True)
+            t_time = time.time() - s_time
+            if self.gpu_id == 0:
+                print(f"epoch={epoch:04d}, cur_lr={self.scheduler.get_lr()[0]:.5f}, "
+                      f"train_loss={train_loss:.6f}, train_time={t_time:.2f}", flush=True)
+
+    def validation(self, max_val_batches: int) -> float:
+        """
+        The validation iteration.
+        :param max_val_batches: the maximum number of batches to validate
+        :return: the average validation loss
+        """
+        self.model.eval()
+        n_batches = 0
+        
+        # Initialize accumulators for all loss components
+        loss_sum = 0
+        cmim_total_sum = 0
+        recon_loss_sum = 0
+        cmim_loss_sum = 0
+        log_p_k1_sum = 0
+        log_q_z_sum = 0
+        log_P_z_sum = 0
+        recon_accuracy_sum = 0
+        vocab_loss_sum = 0
+        av_loss_sum = 0
+        bv_loss_sum = 0
+        fg_loss_sum = 0
+
+        for ibatch, item in enumerate(self.val_dataloader):
+            # Move vocab targets to GPU
+            targets = item["targets"]
+            targets["av_task"] = targets["av_task"].to(self.gpu_id)
+            targets["bv_task"] = targets["bv_task"].to(self.gpu_id)
+            targets["fg_task"] = targets["fg_task"].to(self.gpu_id)
+            
+            # Forward pass
+            preds = self.model(item)
+            
+            # Compute loss - returns all components
+            (overall_loss, cmim_total, recon_loss, cmim_loss, log_p_k1, log_q_z, log_P_z, 
+             recon_accuracy, vocab_overall, av_loss, bv_loss, fg_loss, 
+             av_dist_loss, bv_dist_loss, fg_dist_loss) = self.loss_func(preds, targets)
+
+            loss_sum += overall_loss.item()
+            cmim_total_sum += cmim_total.item()
+            recon_loss_sum += recon_loss.item()
+            cmim_loss_sum += cmim_loss.item()
+            log_p_k1_sum += log_p_k1.item()
+            log_q_z_sum += log_q_z.item()
+            log_P_z_sum += log_P_z.item()
+            if self.args.tensorboard and recon_accuracy is not None:
+                recon_accuracy_sum += recon_accuracy.item()
+            vocab_loss_sum += vocab_overall.item() if not isinstance(vocab_overall, float) else vocab_overall
+            av_loss_sum += av_loss.item() if not isinstance(av_loss, float) else av_loss
+            bv_loss_sum += bv_loss.item() if not isinstance(bv_loss, float) else bv_loss
+            fg_loss_sum += fg_loss.item() if not isinstance(fg_loss, float) else fg_loss
+
+            n_batches += 1
+            if n_batches >= max_val_batches:
+                break
+
+        # Compute per batch averages
+        loss_sum /= n_batches
+        cmim_total_sum /= n_batches
+        recon_loss_sum /= n_batches
+        cmim_loss_sum /= n_batches
+        log_p_k1_sum /= n_batches
+        log_q_z_sum /= n_batches
+        log_P_z_sum /= n_batches
+        if self.args.tensorboard:
+            recon_accuracy_sum /= n_batches
+        vocab_loss_sum /= n_batches
+        av_loss_sum /= n_batches
+        bv_loss_sum /= n_batches
+        fg_loss_sum /= n_batches
+
+        if self.gpu_id == 0:
+            print(f"Validation loss: {loss_sum:.4f}, cmim_total: {cmim_total_sum:.4f}, "
+                  f"vocab_loss: {vocab_loss_sum:.4f}, recon_loss: {recon_loss_sum:.4f}", flush=True)
+            
+            if self.args.tensorboard:
+                self.writer.add_scalar('val/loss', loss_sum, self.n_steps)
+                self.writer.add_scalar('val/cmim_total', cmim_total_sum, self.n_steps)
+                self.writer.add_scalar('val/recon_loss', recon_loss_sum, self.n_steps)
+                self.writer.add_scalar('val/cmim_loss', cmim_loss_sum, self.n_steps)
+                self.writer.add_scalar('val/log_p_k1_given_zx', log_p_k1_sum, self.n_steps)
+                self.writer.add_scalar('val/log_q_z_given_x', log_q_z_sum, self.n_steps)
+                self.writer.add_scalar('val/log_P_z', log_P_z_sum, self.n_steps)
+                self.writer.add_scalar('val/recon_accuracy', recon_accuracy_sum, self.n_steps)
+                self.writer.add_scalar('val/vocab_loss', vocab_loss_sum, self.n_steps)
+                self.writer.add_scalar('val/av_loss', av_loss_sum, self.n_steps)
+                self.writer.add_scalar('val/bv_loss', bv_loss_sum, self.n_steps)
+                self.writer.add_scalar('val/fg_loss', fg_loss_sum, self.n_steps)
+
+        self.model.train()
+        return loss_sum
+
+    def set_batch_idx(self, batch_idx: int):
+        self.curr_epoch_batch_idx = batch_idx
+
+    def iter(self, epoch, train=True) -> List:
+        """
+        Perform a training / validation iteration.
+        :param epoch: the current epoch number
+        :param train: True: train model, False: validation model
+        :return: the loss terms as a list
+        """
+        if train:
+            self.model.train()
+            self.train_dataloader.sampler.set_epoch(epoch)
+        else:
+            self.model.eval()
+
+        loss_sum, iter_count = 0, 0
+        cum_loss_sum, cum_iter_count = 0, 0
+        
+        # Accumulators for logging
+        cmim_total_sum = 0
+        recon_loss_sum = 0
+        cmim_loss_sum = 0
+        log_p_k1_sum = 0
+        log_q_z_sum = 0
+        log_P_z_sum = 0
+        recon_accuracy_sum = 0
+        vocab_loss_sum = 0
+        av_loss_sum = 0
+        bv_loss_sum = 0
+        fg_loss_sum = 0
+
+        for ibatch, item in enumerate(self.train_dataloader):
+            if self.first_epoch_post_resume:
+                if ibatch < self.curr_epoch_batch_idx:
+                    print(f"Skipping batch {ibatch} because of curr_epoch_batch_idx={self.curr_epoch_batch_idx}", 
+                          flush=True)
+                    continue
+                elif ibatch >= self.curr_epoch_batch_idx:
+                    print(f"Stop skipping batches because of curr_epoch_batch_idx={self.curr_epoch_batch_idx}", 
+                          flush=True)
+                    self.first_epoch_post_resume = False
+
+            if self.gpu_id == 0:
+                print(f"{self.n_steps=}", flush=True)
+            
+            # Move vocab targets to GPU
+            targets = item["targets"]
+            targets["av_task"] = targets["av_task"].to(self.gpu_id)
+            targets["bv_task"] = targets["bv_task"].to(self.gpu_id)
+            targets["fg_task"] = targets["fg_task"].to(self.gpu_id)
+            
+            # Forward pass
+            preds = self.model(item)
+
+            # Compute loss - returns all components
+            (overall_loss, cmim_total, recon_loss, cmim_loss, log_p_k1, log_q_z, log_P_z, 
+             recon_accuracy, vocab_overall, av_loss, bv_loss, fg_loss, 
+             av_dist_loss, bv_dist_loss, fg_dist_loss) = self.loss_func(preds, targets)
+
+            loss_sum += overall_loss.item()
+            iter_count += self.args.batch_size
+
+            if train:
+                cum_loss_sum += overall_loss.item()
+                self.model.zero_grad()
+                self.optimizer.zero_grad()
+                overall_loss.backward()
+                self.optimizer.step()
+                self.scheduler.step()
+            else:
+                cum_loss_sum += overall_loss.item()
+
+            # Accumulate for logging
+            cmim_total_sum += cmim_total.item()
+            recon_loss_sum += recon_loss.item()
+            cmim_loss_sum += cmim_loss.item()
+            log_p_k1_sum += log_p_k1.item()
+            log_q_z_sum += log_q_z.item()
+            log_P_z_sum += log_P_z.item()
+            if self.args.tensorboard and recon_accuracy is not None:
+                recon_accuracy_sum += recon_accuracy.item()
+            vocab_loss_sum += vocab_overall.item() if not isinstance(vocab_overall, float) else vocab_overall
+            av_loss_sum += av_loss.item() if not isinstance(av_loss, float) else av_loss
+            bv_loss_sum += bv_loss.item() if not isinstance(bv_loss, float) else bv_loss
+            fg_loss_sum += fg_loss.item() if not isinstance(fg_loss, float) else fg_loss
+
+            # Save model
+            if (self.gpu_id == 0) and (self.n_steps % self.args.save_interval) == 0:
+                self.save(batch_idx=ibatch, n_steps=self.n_steps, epoch=epoch,
+                         file_path=self.args.save_dir, name=f"model_step_{self.n_steps}.pt", save_last=True)
+
+            cum_iter_count += 1
+            self.n_iter += self.args.batch_size
+            self.n_steps += 1
+
+            if self.gpu_id == 0 and self.args.tensorboard and self.n_steps % 10 == 0:
+                self.writer.add_scalar('train/loss', overall_loss.item(), self.n_steps)
+                self.writer.add_scalar('train/cmim_total', cmim_total.item(), self.n_steps)
+                self.writer.add_scalar('train/recon_loss', recon_loss.item(), self.n_steps)
+                self.writer.add_scalar('train/cmim_loss', cmim_loss.item(), self.n_steps)
+                self.writer.add_scalar('train/log_p_k1_given_zx', log_p_k1.item(), self.n_steps)
+                self.writer.add_scalar('train/log_q_z_given_x', log_q_z.item(), self.n_steps)
+                self.writer.add_scalar('train/log_P_z', log_P_z.item(), self.n_steps)
+                if recon_accuracy is not None:
+                    self.writer.add_scalar('train/recon_accuracy', recon_accuracy.item(), self.n_steps)
+                vocab_overall_val = vocab_overall.item() if not isinstance(vocab_overall, float) else vocab_overall
+                av_loss_val = av_loss.item() if not isinstance(av_loss, float) else av_loss
+                bv_loss_val = bv_loss.item() if not isinstance(bv_loss, float) else bv_loss
+                fg_loss_val = fg_loss.item() if not isinstance(fg_loss, float) else fg_loss
+                self.writer.add_scalar('train/vocab_loss', vocab_overall_val, self.n_steps)
+                self.writer.add_scalar('train/av_loss', av_loss_val, self.n_steps)
+                self.writer.add_scalar('train/bv_loss', bv_loss_val, self.n_steps)
+                self.writer.add_scalar('train/fg_loss', fg_loss_val, self.n_steps)
+                self.writer.add_scalar('train/lr', self.scheduler.get_lr()[0], self.n_steps)
+                self.writer.add_scalar('train/epoch', epoch, self.n_steps)
+                self.writer.add_scalar('train/batch_idx', ibatch, self.n_steps)
+
+        cum_loss_sum /= cum_iter_count
+        cmim_loss_sum /= cum_iter_count
+        vocab_loss_sum /= cum_iter_count
+
+        val_loss = self.validation(max_val_batches=self.args.max_val_batches)
+
+        return self.n_iter, cum_loss_sum, (cmim_loss_sum, vocab_loss_sum)
+
+    def save(self, batch_idx, n_steps, epoch, file_path, name=None, save_last=False) -> str:
+        """
+        Save the intermediate models during training.
+        """
+        return save_checkpoint(self.model, self.optimizer, self.args, batch_idx,
+                              n_steps, epoch, file_path, name, save_last)
+
+    def load(self, checkpoint_path) -> Tuple[int, int, int]:
+        """
+        Load checkpoint for hybrid training.
+        :param checkpoint_path: path to checkpoint file
+        :return: tuple of (epoch, scheduler_step, batch_idx)
+        """
+        epoch, scheduler_step, batch_idx = load_checkpoint(
+            checkpoint_path, self.model, self.optimizer, self.scheduler
+        )
+        self.n_steps = scheduler_step
+        return epoch, scheduler_step, batch_idx
     

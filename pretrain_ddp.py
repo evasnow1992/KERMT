@@ -32,10 +32,14 @@ from torch.distributed import init_process_group, destroy_process_group
 import os
 
 
-from kermt.data.kermtdataset import get_data, split_data, KermtCollator, KermtDecoderCollator
+from kermt.data.kermtdataset import (
+    get_data, split_data, 
+    KermtCollator, KermtDecoderCollator, KermtHybridCollator,
+    get_pretokenized_data, KermtPreTokenizedDecoderCollator
+)
 from kermt.util.utils import create_logger
 from kermt.model.models import KERMTEmbedding
-from task.kermttrainer import KERMTTrainer, KERMTCMIMTrainer
+from task.kermttrainer import KERMTTrainer, KERMTCMIMTrainer, KERMTHybridTrainer
 from kermt.util.scheduler import NoamLR
 from kermt.data.torchvocab import MolVocab, SMILESVocab
 from kermt.data.kermtdataset import BatchMolDataset
@@ -105,23 +109,102 @@ def main(rank: int, world_size: int):
     logger = create_logger(name='pretrain', save_dir=args.save_dir)
 
     # Build train, val, and test datasets
-    train_data, train_sample_per_file = get_data(data_path=args.train_data_path)
-    train_data_size = len(train_data)
-    print(f"Training data size: {train_data_size}")
-    pre_load_data_ddp(train_data, train_data_size, train_sample_per_file)
-
-    if args.val_data_path is not None:
-        val_data, val_sample_per_file = get_data(data_path=args.val_data_path)
-        val_data_size = len(val_data)
-        print(f"Validation data size: {val_data_size}")
-        pre_load_data_ddp(val_data, val_data_size, val_sample_per_file)
+    # For CMIM-only pretraining, skip loading feature files (not used by decoder)
+    # For hybrid and vocab modes, we need features for functional group prediction
+    load_features = args.pretrain_mode != 'cmim'
+    
+    # Check if using pre-tokenized data (memory-efficient CMIM training)
+    use_pretokenized = (args.pretrain_mode == 'cmim' and 
+                        hasattr(args, 'tokens_dir') and 
+                        args.tokens_dir is not None)
+    
+    # Track whether val uses pre-tokenized data (needed for collator selection)
+    val_use_pretokenized = False
+    
+    if use_pretokenized:
+        # Memory-efficient loading with pre-tokenized .npy files
+        if rank == 0:
+            print("[INFO] Using pre-tokenized data for CMIM training (memory-efficient mode)")
+            print(f"[INFO] Tokens directory: {args.tokens_dir}")
+        
+        # Construct tokens_dir for train and val
+        train_tokens_dir = args.tokens_dir
+        train_data, train_sample_per_file = get_pretokenized_data(
+            data_path=args.train_data_path, 
+            tokens_dir=train_tokens_dir
+        )
+        train_data_size = len(train_data)
+        if rank == 0:
+            print(f"Training data size: {train_data_size}")
+        # No pre-loading needed - memory-mapped files are loaded on-demand
+        
+        if args.val_data_path is not None:
+            # Infer val tokens dir: replace 'train' with 'val' in tokens_dir
+            val_tokens_dir = args.tokens_dir.replace('/train/', '/val/')
+            if val_tokens_dir == args.tokens_dir:
+                # Fall back: assume tokens_dir is just the split directory
+                val_tokens_dir = os.path.join(os.path.dirname(args.tokens_dir), 'val', 'tokens')
+            
+            if os.path.exists(val_tokens_dir):
+                val_data, val_sample_per_file = get_pretokenized_data(
+                    data_path=args.val_data_path,
+                    tokens_dir=val_tokens_dir
+                )
+                val_data_size = len(val_data)
+                val_use_pretokenized = True
+                if rank == 0:
+                    print(f"Validation data size: {val_data_size}")
+            else:
+                if rank == 0:
+                    print(f"[WARNING] Val tokens dir not found: {val_tokens_dir}")
+                    print("[WARNING] Falling back to standard data loading for validation")
+                val_data, val_sample_per_file = get_data(data_path=args.val_data_path, load_features=False)
+                val_data_size = len(val_data)
+                val_use_pretokenized = False
+                pre_load_data_ddp(val_data, val_data_size, val_sample_per_file)
+        else:
+            val_data = None
+            val_data_size = 0
     else:
-        val_data = None
-        val_data_size = 0
+        # Standard data loading - with optional lazy loading for large datasets
+        max_cached = args.max_cached_files if args.lazy_loading else 0  # 0 = no limit when pre-loading
+        
+        train_data, train_sample_per_file = get_data(
+            data_path=args.train_data_path, 
+            load_features=load_features,
+            max_cached_files=max_cached
+        )
+        train_data_size = len(train_data)
+        print(f"Training data size: {train_data_size}")
+        
+        # Pre-load data unless lazy_loading is enabled (for very large datasets)
+        if args.lazy_loading:
+            if rank == 0:
+                print(f"[INFO] Lazy loading enabled - skipping data pre-load. LRU cache size: {args.max_cached_files} files")
+                if args.num_dataloader_workers > 0:
+                    print(f"[WARNING] lazy_loading with num_dataloader_workers={args.num_dataloader_workers} > 0 "
+                          f"may cause duplicate caching across workers. "
+                          f"Consider using --num_dataloader_workers 0 or 1 for memory efficiency.")
+        else:
+            pre_load_data_ddp(train_data, train_data_size, train_sample_per_file)
+
+        if args.val_data_path is not None:
+            val_data, val_sample_per_file = get_data(
+                data_path=args.val_data_path, 
+                load_features=load_features,
+                max_cached_files=max_cached
+            )
+            val_data_size = len(val_data)
+            print(f"Validation data size: {val_data_size}")
+            if not args.lazy_loading:
+                pre_load_data_ddp(val_data, val_data_size, val_sample_per_file)
+        else:
+            val_data = None
+            val_data_size = 0
 
     if args.test_data_path is not None:
         raise NotImplementedError("Test data is not implemented")
-        test_data, test_sample_per_file = get_data(data_path=args.test_data_path)
+        test_data, test_sample_per_file = get_data(data_path=args.test_data_path, load_features=load_features)
         test_data_size = len(test_data)
         print(f"Test data size: {test_data_size}")
         pre_load_data_ddp(test_data, test_data_size, test_sample_per_file)
@@ -147,11 +230,43 @@ def main(rank: int, world_size: int):
     # Build collator based on training mode
     shared_dict = {}
     
-    if args.use_cmim:
+    if args.pretrain_mode == 'hybrid':
+        # Hybrid mode - needs both SMILES vocab and atom/bond vocabularies
+        if args.smiles_vocab_path is None:
+            raise ValueError(
+                "Hybrid training (--pretrain_mode hybrid) requires --smiles_vocab_path\n"
+                "Example: --smiles_vocab_path path/to/pretrain_smiles_vocab.pkl"
+            )
+        if args.atom_vocab_path is None or args.bond_vocab_path is None:
+            raise ValueError(
+                "Hybrid training (--pretrain_mode hybrid) requires --atom_vocab_path and --bond_vocab_path\n"
+                "Example: --atom_vocab_path path/to/pretrain_atom_vocab.pkl "
+                "--bond_vocab_path path/to/pretrain_bond_vocab.pkl"
+            )
+        if rank == 0:
+            print("[INFO] Hybrid mode: Loading all vocabularies")
+        smiles_vocab = SMILESVocab.load_vocab(args.smiles_vocab_path)
+        smiles_vocab_size = len(smiles_vocab)
+        atom_vocab = MolVocab.load_vocab(args.atom_vocab_path)
+        bond_vocab = MolVocab.load_vocab(args.bond_vocab_path)
+        atom_vocab_size, bond_vocab_size = len(atom_vocab), len(bond_vocab)
+        if rank == 0:
+            print(f"[INFO] SMILES vocabulary size: {smiles_vocab_size}")
+            print(f"[INFO] Atom vocabulary size: {atom_vocab_size}, Bond vocabulary size: {bond_vocab_size}")
+        # Hybrid training - use KermtHybridCollator
+        mol_collator = KermtHybridCollator(
+            shared_dict=shared_dict,
+            smiles_vocab=smiles_vocab,
+            atom_vocab=atom_vocab,
+            bond_vocab=bond_vocab,
+            args=args
+        )
+        val_collator = mol_collator
+    elif args.pretrain_mode == 'cmim':
         # CMIM mode - only needs SMILES vocabulary
         if args.smiles_vocab_path is None:
             raise ValueError(
-                "CMIM training (--use_cmim) requires --smiles_vocab_path\n"
+                "CMIM training (--pretrain_mode cmim) requires --smiles_vocab_path\n"
                 "Example: --smiles_vocab_path path/to/pretrain_smiles_vocab.pkl"
             )
         if rank == 0:
@@ -160,17 +275,39 @@ def main(rank: int, world_size: int):
         smiles_vocab_size = len(smiles_vocab)
         if rank == 0:
             print(f"[INFO] SMILES vocabulary size: {smiles_vocab_size}")
-        # CMIM training - use KermtDecoderCollator
-        mol_collator = KermtDecoderCollator(
-            shared_dict=shared_dict,
-            smiles_vocab=smiles_vocab,
-            args=args
-        )
-    else:
+        
+        # CMIM training - use appropriate collator based on data type
+        if use_pretokenized:
+            if rank == 0:
+                print("[INFO] Using KermtPreTokenizedDecoderCollator for train (memory-efficient)")
+            mol_collator = KermtPreTokenizedDecoderCollator(
+                shared_dict=shared_dict,
+                smiles_vocab=smiles_vocab,
+                args=args
+            )
+            # Val may use different collator if it fell back to standard loading
+            if val_use_pretokenized:
+                val_collator = mol_collator
+            else:
+                if rank == 0 and val_data is not None:
+                    print("[INFO] Using KermtDecoderCollator for val (standard data)")
+                val_collator = KermtDecoderCollator(
+                    shared_dict=shared_dict,
+                    smiles_vocab=smiles_vocab,
+                    args=args
+                )
+        else:
+            mol_collator = KermtDecoderCollator(
+                shared_dict=shared_dict,
+                smiles_vocab=smiles_vocab,
+                args=args
+            )
+            val_collator = mol_collator
+    else:  # args.pretrain_mode == 'vocab'
         # Vocab-based pretraining mode - only needs atom and bond vocabularies
         if args.atom_vocab_path is None or args.bond_vocab_path is None:
             raise ValueError(
-                "Vocab-based pretraining requires --atom_vocab_path and --bond_vocab_path\n"
+                "Vocab-based pretraining (--pretrain_mode vocab) requires --atom_vocab_path and --bond_vocab_path\n"
                 "Example: --atom_vocab_path path/to/pretrain_atom_vocab.pkl "
                 "--bond_vocab_path path/to/pretrain_bond_vocab.pkl"
             )
@@ -188,6 +325,7 @@ def main(rank: int, world_size: int):
             bond_vocab=bond_vocab,
             args=args
         )
+        val_collator = mol_collator
 
     train_dataloader = DataLoader(train_data, batch_size=args.batch_size, # batch size per GPU (aka micro batch size)
                                   shuffle=False, # because train_sampler does the shuffling
@@ -201,7 +339,7 @@ def main(rank: int, world_size: int):
                                   shuffle=False, # because no shuffling needed
                                   num_workers=args.num_dataloader_workers,
                                   sampler=val_sampler,
-                                  collate_fn=mol_collator,
+                                  collate_fn=val_collator,
                                   drop_last=True)
     else:
         val_dataloader = None
@@ -209,8 +347,24 @@ def main(rank: int, world_size: int):
     # Build model - create complete task model based on training mode
     # This ensures all model parameters (encoder, decoder, heads) are included
     kermt_embedding = KERMTEmbedding(args)
+    fg_size = 85  # Fixed size for functional group labels
     
-    if args.use_cmim:
+    if args.pretrain_mode == 'hybrid':
+        # Build hybrid task model (encoder + latent + decoder + vocab heads)
+        if rank == 0:
+            print("[INFO] Building KermtHybridTask model")
+        from kermt.model.models import KermtHybridTask
+        model = KermtHybridTask(
+            args,
+            kermt=kermt_embedding,
+            latent_dim=args.latent_dim,
+            contrastive_temperature=args.contrastive_temperature,
+            smiles_vocab_size=smiles_vocab_size,
+            atom_vocab_size=atom_vocab_size,
+            bond_vocab_size=bond_vocab_size,
+            fg_size=fg_size
+        )
+    elif args.pretrain_mode == 'cmim':
         # Build complete CMIM task model (encoder + latent distribution + decoder)
         if rank == 0:
             print("[INFO] Building KermtCMIMTask model")
@@ -222,12 +376,11 @@ def main(rank: int, world_size: int):
             contrastive_temperature=args.contrastive_temperature,
             smiles_vocab_size=smiles_vocab_size
         )
-    else:
+    else:  # args.pretrain_mode == 'vocab'
         # Build complete vocab task model (encoder + vocab prediction heads)
         if rank == 0:
             print("[INFO] Building KermtTask model")
         from kermt.model.models import KermtTask
-        fg_size = 85
         model = KermtTask(
             args,
             kermt=kermt_embedding,
@@ -256,7 +409,21 @@ def main(rank: int, world_size: int):
     )
  
     # Build trainer - pass the complete model
-    if args.use_cmim:
+    if args.pretrain_mode == 'hybrid':
+        if rank == 0:
+            print("[INFO] Initializing KERMTHybridTrainer")
+        trainer = KERMTHybridTrainer(
+            args=args,
+            model=model,
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            gpu_id=rank,
+            n_steps=0,
+            logger=logger
+        )
+    elif args.pretrain_mode == 'cmim':
         if rank == 0:
             print("[INFO] Initializing KERMTCMIMTrainer")
         trainer = KERMTCMIMTrainer(
@@ -270,7 +437,7 @@ def main(rank: int, world_size: int):
             n_steps=0,
             logger=logger
         )
-    else:
+    else:  # args.pretrain_mode == 'vocab'
         if rank == 0:
             print("[INFO] Initializing KERMTTrainer (vocab-based pretraining)")
         trainer = KERMTTrainer(

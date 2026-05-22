@@ -599,9 +599,16 @@ def load_args(path: str) -> Namespace:
 
 def get_ffn_layer_names(model: KermtFinetuneTask):
     """
-    Get the ffn layer id for KermtFinetune Task. (Adhoc!)
-    :param model:
-    :return:
+    Get parameter tensor ids for task-specific layers in KermtFinetuneTask.
+    
+    Task-specific layers are those added for finetuning (not from pretrained checkpoint):
+    - FFN layers: mol_atom_from_atom_ffn, mol_atom_from_bond_ffn
+    - Readout attention layers: readout.attn (when using self_attention)
+    
+    These should be trained with full learning rate during finetuning.
+    
+    :param model: The KermtFinetuneTask model
+    :return: List of parameter tensor memory ids for task-specific layers
     """
     # Readout and atom/bond ffn layers are returned
     return [name for name, _ in model.named_parameters() if "kermt" not in name]
@@ -651,7 +658,11 @@ def build_lr_scheduler(optimizer, args: Namespace, total_epochs: List[int] = Non
     """
 
     # Learning rate scheduler
-    # Divide the parameter into two groups for the finetune.
+    # When fine_tune_coff == 0, encoder is frozen and not in optimizer,
+    # so we only have task params (1 group) with full LR (fine_tune_coff=1.0)
+    # When fine_tune_coff > 0, we have 2 groups: encoder (index 0) and task (index 1)
+    scheduler_fine_tune_coff = 1.0 if args.fine_tune_coff == 0 else args.fine_tune_coff
+    
     return NoamLR(
         optimizer=optimizer,
         warmup_epochs=args.warmup_epochs,
@@ -660,7 +671,7 @@ def build_lr_scheduler(optimizer, args: Namespace, total_epochs: List[int] = Non
         init_lr=args.init_lr,
         max_lr=args.max_lr,
         final_lr=args.final_lr,
-        fine_tune_coff=args.fine_tune_coff
+        fine_tune_coff=scheduler_fine_tune_coff
     )
 
 

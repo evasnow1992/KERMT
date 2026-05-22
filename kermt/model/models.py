@@ -52,6 +52,133 @@ from kermt.util.loss_utils import normalize_loss_gradient
 from kermt.util.nn_utils import get_activation_function
 
 
+# ============================================================================
+# Shared helper functions for CMIM loss computation
+# ============================================================================
+
+def compute_batchwise_cosine_sim(z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute cosine similarity between latent vectors in a batch.
+    Shared by KermtCMIMTask and KermtHybridTask.
+    
+    Args:
+        z: latent vectors [batch_size, latent_dim]
+        
+    Returns:
+        sim_to_pos: similarity to self [batch_size] (always 1.0)
+        sim_to_neg: similarity to other samples [batch_size, batch_size-1]
+    """
+    b = z.shape[0]
+    z = z.view(b, -1)  # Flatten if needed
+    
+    # Normalize to unit vectors
+    z_norm = torch.nn.functional.normalize(z, dim=1)
+    
+    # Similarity to positive (self) - should be 1.0
+    sim_to_pos = (z_norm * z_norm).sum(dim=1)  # [b]
+    
+    # Similarity matrix (all pairs)
+    sim_matrix = z_norm @ z_norm.T  # [b, b]
+    
+    # Mask out diagonal and extract negative pairs
+    mask = ~torch.eye(b, dtype=bool, device=z.device)
+    sim_to_neg = sim_matrix[mask].view(b, b - 1)  # [b, b-1]
+    
+    return sim_to_pos, sim_to_neg
+
+
+def compute_cmim_loss(
+    mean: torch.Tensor,
+    log_scale: torch.Tensor,
+    z_latent: torch.Tensor,
+    contrastive_temperature: float,
+    normalize_gradient: bool = False,
+    normalize_loss: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """
+    Compute CMIM loss (without reconstruction component).
+    Shared by KermtCMIMTask and KermtHybridTask.
+    
+    Args:
+        mean: mean of latent distribution [batch_size, latent_dim]
+        log_scale: log scale of latent distribution [batch_size, latent_dim]
+        z_latent: sampled latent vectors [batch_size, latent_dim]
+        contrastive_temperature: temperature parameter for contrastive loss
+        normalize_gradient: whether to normalize gradients by latent dimensionality
+        normalize_loss: whether to normalize loss values by latent dimensionality
+        
+    Returns:
+        dictionary containing loss components:
+            - cmim_loss: the CMIM loss [batch_size]
+            - log_p_k1_given_zx: contrastive log probability [batch_size]
+            - log_q_z_given_x: encoder log probability [batch_size]
+            - log_P_z: prior log probability [batch_size]
+    """
+    b = mean.shape[0]
+    
+    # Compute normalization coefficient for latent space
+    # Following MIM-playground: 1 / product of all non-batch dimensions
+    z_grad_coeff = 1.0 / torch.prod(torch.tensor(z_latent.shape[1:], dtype=torch.float32)).item()
+    
+    # q(z|x) - the encoder distribution
+    q_z_given_x = torch.distributions.Normal(
+        loc=mean,
+        scale=torch.exp(log_scale),
+    )
+    
+    # P(z) - the prior (standard normal)
+    P_z = torch.distributions.Normal(
+        loc=torch.zeros_like(mean),
+        scale=torch.ones_like(log_scale),
+    )
+    
+    # Contrastive loss component: log p(k=1|z,x)
+    if b > 1:
+        # Compute cosine similarity between z and itself, and z and other samples
+        z_sim_to_pos, z_sim_to_neg = compute_batchwise_cosine_sim(z_latent)  # [b], [b, b-1]
+        
+        # Scale by temperature to get logits
+        pos_logits = z_sim_to_pos / contrastive_temperature  # [b]
+        neg_logits = z_sim_to_neg / contrastive_temperature  # [b, b-1]
+        
+        # Numerically stable log-softmax for contrastive loss
+        # log p(k=1|z,x) = pos_logits - log(exp(pos_logits) + sum(exp(neg_logits)))
+        log_p_k1_given_zx = (
+            pos_logits - 
+            torch.logsumexp(
+                torch.cat([pos_logits.unsqueeze(1), neg_logits - math.log(b - 1)], dim=1),
+                dim=1
+            )
+        )  # [b]
+    else:
+        # Batch size 1: skip contrastive loss
+        log_p_k1_given_zx = torch.zeros(b, device=z_latent.device)
+    
+    # KL divergence components - apply gradient normalization if enabled
+    log_q_z_given_x = normalize_loss_gradient(
+        q_z_given_x.log_prob(z_latent).sum(-1),  # [b, latent_dim] => [b]
+        z_grad_coeff,
+        normalize_gradient=normalize_gradient,
+        normalize_loss=normalize_loss,
+    )
+    log_P_z = normalize_loss_gradient(
+        P_z.log_prob(z_latent).sum(-1),  # [b, latent_dim] => [b]
+        z_grad_coeff,
+        normalize_gradient=normalize_gradient,
+        normalize_loss=normalize_loss,
+    )
+    
+    # CMIM loss: -[log p(k=1|z,x) + 0.5 * (log q(z|x) + log P(z))]
+    cmim_loss = -(log_p_k1_given_zx + 0.5 * (log_q_z_given_x + log_P_z))  # [b]
+    
+    return {
+        "cmim_loss": cmim_loss,
+        "log_p_k1_given_zx": log_p_k1_given_zx,
+        "log_q_z_given_x": log_q_z_given_x,
+        "log_P_z": log_P_z,
+    }
+
+
 class KERMTEmbedding(nn.Module):
     """
     The KERMT Embedding class. It contains the GTransEncoder.
@@ -344,6 +471,8 @@ class SMILESTransformerDecoder(nn.Module):
     Takes molecular latent representation and autoregressively generates SMILES.
     
     Supports both RoPE (Rotary Position Embedding) and classic sinusoidal positional encoding.
+    Optionally supports G1 gating (SDPA output gating) for improved attention performance.
+    Gating can be independently enabled for self-attention and cross-attention.
     """
     
     def __init__(self, 
@@ -355,7 +484,9 @@ class SMILESTransformerDecoder(nn.Module):
                  dropout: float = 0.1,
                  max_seq_len: int = 512,
                  pad_token_id: int = 0,
-                 positional_encoding: str = 'rope'):
+                 positional_encoding: str = 'rope',
+                 gate_self_attn: bool = False,
+                 gate_cross_attn: bool = False):
         """
         Initialize the SMILES transformer decoder.
         
@@ -368,6 +499,8 @@ class SMILESTransformerDecoder(nn.Module):
         :param max_seq_len: maximum sequence length
         :param pad_token_id: ID of padding token in vocabulary
         :param positional_encoding: type of positional encoding ('rope' or 'sinusoidal')
+        :param gate_self_attn: whether to apply G1 gating to self-attention (only for 'rope' mode)
+        :param gate_cross_attn: whether to apply G1 gating to cross-attention (only for 'rope' mode)
         """
         super(SMILESTransformerDecoder, self).__init__()
         
@@ -375,6 +508,8 @@ class SMILESTransformerDecoder(nn.Module):
         self.vocab_size = vocab_size
         self.pad_token_id = pad_token_id
         self.positional_encoding = positional_encoding
+        self.gate_self_attn = gate_self_attn
+        self.gate_cross_attn = gate_cross_attn
         
         # Token embedding layer
         self.token_embedding = nn.Embedding(vocab_size, hidden_size, padding_idx=pad_token_id)
@@ -385,7 +520,7 @@ class SMILESTransformerDecoder(nn.Module):
             self.pos_encoder = None
             self.input_dropout = nn.Dropout(dropout)
             
-            # Transformer decoder layers with RoPE
+            # Transformer decoder layers with RoPE and optional G1 gating
             self.decoder_layers = nn.ModuleList([
                 RoPETransformerDecoderLayer(
                     d_model=hidden_size,
@@ -393,7 +528,9 @@ class SMILESTransformerDecoder(nn.Module):
                     dim_feedforward=ffn_hidden_size,
                     dropout=dropout,
                     activation='relu',
-                    max_seq_len=max_seq_len
+                    max_seq_len=max_seq_len,
+                    gate_self_attn=gate_self_attn,
+                    gate_cross_attn=gate_cross_attn
                 )
                 for _ in range(num_layers)
             ])
@@ -403,6 +540,12 @@ class SMILESTransformerDecoder(nn.Module):
             # Classic sinusoidal positional encoding
             self.pos_encoder = PositionalEncoding(hidden_size, dropout, max_seq_len)
             self.input_dropout = None
+            
+            # Note: G1 gating is not supported with sinusoidal encoding (uses standard PyTorch layers)
+            if gate_self_attn or gate_cross_attn:
+                import warnings
+                warnings.warn("gate_self_attn/gate_cross_attn are only supported with "
+                            "positional_encoding='rope'. Ignoring for sinusoidal mode.")
             
             # Standard PyTorch transformer decoder layers
             decoder_layer = nn.TransformerDecoderLayer(
@@ -567,20 +710,122 @@ class SMILESTransformerDecoder(nn.Module):
         return loss_per_sample, total_loss, accuracy_per_sample, total_accuracy
 
 
-class KermtTask(nn.Module):
+class VocabPredictionModule(nn.Module):
     """
-    The pretrain module.
+    Modular vocabulary prediction heads for GROVER pretraining.
+    Encapsulates atom vocab, bond vocab, and functional group prediction tasks.
+    Can be used standalone (in KermtTask) or composed with other modules (in KermtHybridTask).
     """
-    def __init__(self, args, kermt, atom_vocab_size, bond_vocab_size, fg_size):
-        super(KermtTask, self).__init__()
-        self.kermt = kermt
+    
+    def __init__(self, args, atom_vocab_size: int, bond_vocab_size: int, fg_size: int):
+        """
+        Initialize vocabulary prediction module.
+        
+        :param args: model arguments
+        :param atom_vocab_size: size of atom vocabulary
+        :param bond_vocab_size: size of bond vocabulary
+        :param fg_size: size of functional group labels
+        """
+        super(VocabPredictionModule, self).__init__()
+        
         self.av_task_atom = AtomVocabPrediction(args, atom_vocab_size)
         self.av_task_bond = AtomVocabPrediction(args, atom_vocab_size)
         self.bv_task_atom = BondVocabPrediction(args, bond_vocab_size)
         self.bv_task_bond = BondVocabPrediction(args, bond_vocab_size)
-
         self.fg_task_all = FunctionalGroupPrediction(args, fg_size)
+        
+        self.embedding_output_type = args.embedding_output_type
+    
+    def forward(self, embeddings: Dict, a_scope: List, b_scope: List) -> Dict:
+        """
+        Compute vocab predictions from embeddings.
+        
+        :param embeddings: dict with atom_from_atom, atom_from_bond, bond_from_atom, bond_from_bond
+        :param a_scope: atom scope for functional group prediction
+        :param b_scope: bond scope for functional group prediction
+        :return: dict with av_task, bv_task, fg_task predictions
+        """
+        av_task_pred_atom = self.av_task_atom(embeddings["atom_from_atom"])
+        av_task_pred_bond = self.av_task_bond(embeddings["atom_from_bond"])
+        bv_task_pred_atom = self.bv_task_atom(embeddings["bond_from_atom"])
+        bv_task_pred_bond = self.bv_task_bond(embeddings["bond_from_bond"])
+        fg_task_pred_all = self.fg_task_all(embeddings, a_scope, b_scope)
+        
+        return {
+            "av_task": (av_task_pred_atom, av_task_pred_bond),
+            "bv_task": (bv_task_pred_atom, bv_task_pred_bond),
+            "fg_task": fg_task_pred_all
+        }
+    
+    @staticmethod
+    def compute_loss(preds: Dict, targets: Dict, dist_coff: float = 0.1) -> Tuple:
+        """
+        Compute vocabulary prediction losses.
+        
+        :param preds: predictions from forward()
+        :param targets: dict with av_task, bv_task, fg_task targets
+        :param dist_coff: disagreement coefficient
+        :return: tuple of (overall_loss, av_loss, bv_loss, fg_loss, av_dist_loss, bv_dist_loss, fg_dist_loss)
+        """
+        av_task_loss = nn.NLLLoss(ignore_index=0, reduction="mean")
+        fg_task_loss = nn.BCEWithLogitsLoss(reduction="mean")
+        av_task_dist_loss = nn.MSELoss(reduction="mean")
+        fg_task_dist_loss = nn.MSELoss(reduction="mean")
+        sigmoid = nn.Sigmoid()
 
+        av_atom_loss, av_bond_loss, av_dist_loss = 0.0, 0.0, 0.0
+        fg_atom_from_atom_loss, fg_atom_from_bond_loss, fg_atom_dist_loss = 0.0, 0.0, 0.0
+        bv_atom_loss, bv_bond_loss, bv_dist_loss = 0.0, 0.0, 0.0
+        fg_bond_from_atom_loss, fg_bond_from_bond_loss, fg_bond_dist_loss = 0.0, 0.0, 0.0
+
+        if preds["av_task"][0] is not None:
+            av_atom_loss = av_task_loss(preds['av_task'][0], targets["av_task"])
+            fg_atom_from_atom_loss = fg_task_loss(preds["fg_task"]["atom_from_atom"], targets["fg_task"])
+
+        if preds["av_task"][1] is not None:
+            av_bond_loss = av_task_loss(preds['av_task'][1], targets["av_task"])
+            fg_atom_from_bond_loss = fg_task_loss(preds["fg_task"]["atom_from_bond"], targets["fg_task"])
+
+        if preds["bv_task"][0] is not None:
+            bv_atom_loss = av_task_loss(preds['bv_task'][0], targets["bv_task"])
+            fg_bond_from_atom_loss = fg_task_loss(preds["fg_task"]["bond_from_atom"], targets["fg_task"])
+
+        if preds["bv_task"][1] is not None:
+            bv_bond_loss = av_task_loss(preds['bv_task'][1], targets["bv_task"])
+            fg_bond_from_bond_loss = fg_task_loss(preds["fg_task"]["bond_from_bond"], targets["fg_task"])
+
+        if preds["av_task"][0] is not None and preds["av_task"][1] is not None:
+            av_dist_loss = av_task_dist_loss(preds['av_task'][0], preds['av_task'][1])
+            fg_atom_dist_loss = fg_task_dist_loss(sigmoid(preds["fg_task"]["atom_from_atom"]),
+                                                  sigmoid(preds["fg_task"]["atom_from_bond"]))
+
+        if preds["bv_task"][0] is not None and preds["bv_task"][1] is not None:
+            bv_dist_loss = av_task_dist_loss(preds['bv_task'][0], preds['bv_task'][1])
+            fg_bond_dist_loss = fg_task_dist_loss(sigmoid(preds["fg_task"]["bond_from_atom"]),
+                                                  sigmoid(preds["fg_task"]["bond_from_bond"]))
+
+        av_loss = av_atom_loss + av_bond_loss
+        bv_loss = bv_atom_loss + bv_bond_loss
+        fg_atom_loss = fg_atom_from_atom_loss + fg_atom_from_bond_loss
+        fg_bond_loss = fg_bond_from_atom_loss + fg_bond_from_bond_loss
+
+        fg_loss = fg_atom_loss + fg_bond_loss
+        fg_dist_loss = fg_atom_dist_loss + fg_bond_dist_loss
+
+        overall_loss = av_loss + bv_loss + fg_loss + dist_coff * av_dist_loss + \
+                       dist_coff * bv_dist_loss + fg_dist_loss
+
+        return overall_loss, av_loss, bv_loss, fg_loss, av_dist_loss, bv_dist_loss, fg_dist_loss
+
+
+class KermtTask(nn.Module):
+    """
+    The pretrain module for vocabulary-based pretraining (original GROVER).
+    """
+    def __init__(self, args, kermt, atom_vocab_size, bond_vocab_size, fg_size):
+        super(KermtTask, self).__init__()
+        self.kermt = kermt
+        self.vocab_module = VocabPredictionModule(args, atom_vocab_size, bond_vocab_size, fg_size)
         self.embedding_output_type = args.embedding_output_type
 
     @staticmethod
@@ -593,70 +838,9 @@ class KermtTask(nn.Module):
         def loss_func(preds, targets, dist_coff=args.dist_coff):
             """
             The loss function for KermtTask.
-            :param preds: the predictions.
-            :param targets: the targets.
-            :param dist_coff: the default disagreement coefficient for the distances between different branches.
-            :return:
+            Delegates to VocabPredictionModule.compute_loss().
             """
-            av_task_loss = nn.NLLLoss(ignore_index=0, reduction="mean")  # same for av and bv
-
-            fg_task_loss = nn.BCEWithLogitsLoss(reduction="mean")
-            # av_task_dist_loss = nn.KLDivLoss(reduction="mean")
-            av_task_dist_loss = nn.MSELoss(reduction="mean")
-            fg_task_dist_loss = nn.MSELoss(reduction="mean")
-            sigmoid = nn.Sigmoid()
-
-            av_atom_loss, av_bond_loss, av_dist_loss = 0.0, 0.0, 0.0
-            fg_atom_from_atom_loss, fg_atom_from_bond_loss, fg_atom_dist_loss = 0.0, 0.0, 0.0
-            bv_atom_loss, bv_bond_loss, bv_dist_loss = 0.0, 0.0, 0.0
-            fg_bond_from_atom_loss, fg_bond_from_bond_loss, fg_bond_dist_loss = 0.0, 0.0, 0.0
-
-            if preds["av_task"][0] is not None:
-                av_atom_loss = av_task_loss(preds['av_task'][0], targets["av_task"])
-                fg_atom_from_atom_loss = fg_task_loss(preds["fg_task"]["atom_from_atom"], targets["fg_task"])
-
-            if preds["av_task"][1] is not None:
-                av_bond_loss = av_task_loss(preds['av_task'][1], targets["av_task"])
-                fg_atom_from_bond_loss = fg_task_loss(preds["fg_task"]["atom_from_bond"], targets["fg_task"])
-
-            if preds["bv_task"][0] is not None:
-                bv_atom_loss = av_task_loss(preds['bv_task'][0], targets["bv_task"])
-                fg_bond_from_atom_loss = fg_task_loss(preds["fg_task"]["bond_from_atom"], targets["fg_task"])
-
-            if preds["bv_task"][1] is not None:
-                bv_bond_loss = av_task_loss(preds['bv_task'][1], targets["bv_task"])
-                fg_bond_from_bond_loss = fg_task_loss(preds["fg_task"]["bond_from_bond"], targets["fg_task"])
-
-            if preds["av_task"][0] is not None and preds["av_task"][1] is not None:
-                av_dist_loss = av_task_dist_loss(preds['av_task'][0], preds['av_task'][1])
-                fg_atom_dist_loss = fg_task_dist_loss(sigmoid(preds["fg_task"]["atom_from_atom"]),
-                                                      sigmoid(preds["fg_task"]["atom_from_bond"]))
-
-            if preds["bv_task"][0] is not None and preds["bv_task"][1] is not None:
-                bv_dist_loss = av_task_dist_loss(preds['bv_task'][0], preds['bv_task'][1])
-                fg_bond_dist_loss = fg_task_dist_loss(sigmoid(preds["fg_task"]["bond_from_atom"]),
-                                                      sigmoid(preds["fg_task"]["bond_from_bond"]))
-
-            av_loss = av_atom_loss + av_bond_loss
-            bv_loss = bv_atom_loss + bv_bond_loss
-            fg_atom_loss = fg_atom_from_atom_loss + fg_atom_from_bond_loss
-            fg_bond_loss = fg_bond_from_atom_loss + fg_bond_from_bond_loss
-
-            fg_loss = fg_atom_loss + fg_bond_loss
-            fg_dist_loss = fg_atom_dist_loss + fg_bond_dist_loss
-
-            # dist_loss = av_dist_loss + bv_dist_loss + fg_dist_loss
-            # print("%.4f %.4f %.4f %.4f %.4f %.4f"%(av_atom_loss,
-            #                                       av_bond_loss,
-            #                                       fg_atom_loss,
-            #                                       fg_bond_loss,
-            #                                       av_dist_loss,
-            #                                       fg_dist_loss))
-            # return av_loss + fg_loss + dist_coff * dist_loss
-            overall_loss = av_loss + bv_loss + fg_loss + dist_coff * av_dist_loss + \
-                           dist_coff * bv_dist_loss + fg_dist_loss
-
-            return overall_loss, av_loss, bv_loss, fg_loss, av_dist_loss, bv_dist_loss, fg_dist_loss
+            return VocabPredictionModule.compute_loss(preds, targets, dist_coff)
 
         return loss_func
 
@@ -671,31 +855,13 @@ class KermtTask(nn.Module):
 
         nvtx.range_push("embedding")
         embeddings = self.kermt(graph_batch)
-        nvtx.range_pop() # embedding
+        nvtx.range_pop()  # embedding
 
-        nvtx.range_push("atom_from_atom")
-        av_task_pred_atom = self.av_task_atom(
-            embeddings["atom_from_atom"])  # if None: means not go through this fowward
-        nvtx.range_pop() # atom_from_atom
-        nvtx.range_push("atom_from_bond") 
-        av_task_pred_bond = self.av_task_bond(embeddings["atom_from_bond"])
-        nvtx.range_pop() # atom_from_bond
+        nvtx.range_push("vocab_prediction")
+        preds = self.vocab_module(embeddings, a_scope, b_scope)
+        nvtx.range_pop()  # vocab_prediction
 
-        nvtx.range_push("bond_from_atom")
-        bv_task_pred_atom = self.bv_task_atom(embeddings["bond_from_atom"])
-        nvtx.range_pop() # bond_from_atom
-
-        nvtx.range_push("bond_from_bond")
-        bv_task_pred_bond = self.bv_task_bond(embeddings["bond_from_bond"])
-        nvtx.range_pop() # bond_from_bond
-
-        nvtx.range_push("fg_task_all")
-        fg_task_pred_all = self.fg_task_all(embeddings, a_scope, b_scope)
-        nvtx.range_pop() # fg_task_all
-
-        return {"av_task": (av_task_pred_atom, av_task_pred_bond),
-                "bv_task": (bv_task_pred_atom, bv_task_pred_bond),
-                "fg_task": fg_task_pred_all}
+        return preds
 
 
 class KermtCMIMTask(nn.Module):
@@ -741,120 +907,10 @@ class KermtCMIMTask(nn.Module):
             dropout=args.decoder_dropout,
             max_seq_len=args.decoder_max_seq_len,
             pad_token_id=0,  # Assuming <pad> is at index 0
-            positional_encoding=args.decoder_positional_encoding
+            positional_encoding=args.decoder_positional_encoding,
+            gate_self_attn=args.decoder_gate_self_attn,
+            gate_cross_attn=args.decoder_gate_cross_attn
         )
-        
-    def _compute_batchwise_cosine_sim(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute cosine similarity between latent vectors in a batch.
-        
-        :param z: latent vectors [batch_size, latent_dim]
-        :return: tuple of (sim_to_pos, sim_to_neg)
-                 sim_to_pos: similarity to self [batch_size]
-                 sim_to_neg: similarity to other samples [batch_size, batch_size-1]
-        """
-        b = z.shape[0]
-        z = z.view(b, -1)  # Flatten if needed
-        
-        # Normalize to unit vectors
-        z_norm = torch.nn.functional.normalize(z, dim=1)
-        
-        # Similarity to positive (self) - should be 1.0
-        sim_to_pos = (z_norm * z_norm).sum(dim=1)  # [b]
-        
-        # Similarity matrix (all pairs)
-        sim_matrix = z_norm @ z_norm.T  # [b, b]
-        
-        # Mask out diagonal and extract negative pairs
-        mask = ~torch.eye(b, dtype=bool, device=z.device)
-        sim_to_neg = sim_matrix[mask].view(b, b - 1)  # [b, b-1]
-        
-        return sim_to_pos, sim_to_neg
-    
-    def compute_cmim_loss(
-        self,
-        mean: torch.Tensor,
-        log_scale: torch.Tensor,
-        z_latent: torch.Tensor,
-        normalize_gradient: bool = False,
-        normalize_loss: bool = False,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute CMIM loss (without reconstruction component).
-        
-        :param mean: mean of latent distribution [batch_size, latent_dim]
-        :param log_scale: log scale of latent distribution [batch_size, latent_dim]
-        :param z_latent: sampled latent vectors [batch_size, latent_dim]
-        :param normalize_gradient: whether to normalize gradients by latent dimensionality
-        :param normalize_loss: whether to normalize loss values by latent dimensionality
-        :return: dictionary containing loss components
-        """
-        b = mean.shape[0]
-        
-        # Compute normalization coefficient for latent space
-        # Following MIM-playground: 1 / product of all non-batch dimensions
-        z_grad_coeff = 1.0 / torch.prod(torch.tensor(z_latent.shape[1:], dtype=torch.float32)).item()
-        
-        # q(z|x) - the encoder distribution
-        q_z_given_x = torch.distributions.Normal(
-            loc=mean,
-            scale=torch.exp(log_scale),
-        )
-        
-        # P(z) - the prior (standard normal)
-        P_z = torch.distributions.Normal(
-            loc=torch.zeros_like(mean),
-            scale=torch.ones_like(log_scale),
-        )
-        
-        # Contrastive loss component: log p(k=1|z,x)
-        if b > 1:
-            # Compute cosine similarity between z and itself, and z and other samples
-            z_sim_to_pos, z_sim_to_neg = self._compute_batchwise_cosine_sim(z_latent)  # [b], [b, b-1]
-            
-            # Scale by temperature to get logits
-            pos_logits = z_sim_to_pos / self.contrastive_temperature  # [b]
-            neg_logits = z_sim_to_neg / self.contrastive_temperature  # [b, b-1]
-            
-            # Numerically stable log-softmax for contrastive loss
-            # log p(k=1|z,x) = pos_logits - log(exp(pos_logits) + sum(exp(neg_logits)))
-            log_p_k1_given_zx = (
-                pos_logits - 
-                torch.logsumexp(
-                    torch.cat([pos_logits.unsqueeze(1), neg_logits - math.log(b - 1)], dim=1),
-                    dim=1
-                )
-            )  # [b]
-        else:
-            # Batch size 1: skip contrastive loss
-            log_p_k1_given_zx = torch.zeros(b, device=z_latent.device)
-        
-        # KL divergence components - apply gradient normalization if enabled
-        log_q_z_given_x = normalize_loss_gradient(
-            q_z_given_x.log_prob(z_latent).sum(-1),  # [b, latent_dim] => [b]
-            z_grad_coeff,
-            normalize_gradient=normalize_gradient,
-            normalize_loss=normalize_loss,
-        )
-        log_P_z = normalize_loss_gradient(
-            P_z.log_prob(z_latent).sum(-1),  # [b, latent_dim] => [b]
-            z_grad_coeff,
-            normalize_gradient=normalize_gradient,
-            normalize_loss=normalize_loss,
-        )
-        
-        # CMIM loss: -[log p(k=1|z,x) + 0.5 * (log q(z|x) + log P(z))]
-        cmim_loss = -(log_p_k1_given_zx + 0.5 * (log_q_z_given_x + log_P_z))  # [b]
-        
-        # Return loss and components for logging
-        loss_dict = {
-            "cmim_loss": cmim_loss,
-            "log_p_k1_given_zx": log_p_k1_given_zx,
-            "log_q_z_given_x": log_q_z_given_x,
-            "log_P_z": log_P_z,
-        }
-        
-        return loss_dict
     
     def get_loss_func(self, args: Namespace) -> Callable:
         """
@@ -890,8 +946,9 @@ class KermtCMIMTask(nn.Module):
             decoder_padding_mask = preds["decoder_padding_mask"]  # [batch_size, seq_len]
             
             # Compute CMIM loss (contrastive + KL divergence) with optional gradient normalization
-            loss_dict = self.compute_cmim_loss(
+            loss_dict = compute_cmim_loss(
                 mean, log_scale, z_latent,
+                contrastive_temperature=self.contrastive_temperature,
                 normalize_gradient=normalize_gradient,
                 normalize_loss=normalize_loss
             )
@@ -974,6 +1031,214 @@ class KermtCMIMTask(nn.Module):
             "decoder_logits": decoder_logits,
             "decoder_target": batch["decoder_target"],
             "decoder_padding_mask": decoder_padding_mask
+        }
+
+
+class KermtHybridTask(nn.Module):
+    """
+    Hybrid pretraining module combining CMIM and vocabulary prediction objectives.
+    
+    This module uses:
+    - CMIM: Contrastive learning + SMILES reconstruction for molecular representation
+    - Vocab: Atom/bond vocabulary prediction (original GROVER objectives)
+    
+    Both objectives share the same KERMT encoder.
+    """
+    
+    def __init__(self, args: Namespace, kermt: KERMTEmbedding = None,
+                 latent_dim: int = None, contrastive_temperature: float = 0.1,
+                 smiles_vocab_size: int = None,
+                 atom_vocab_size: int = None, bond_vocab_size: int = None, fg_size: int = 85):
+        """
+        Initialize the KermtHybridTask.
+        
+        :param args: the arguments containing model configuration
+        :param kermt: optional pre-initialized KERMTEmbedding instance
+        :param latent_dim: dimension of the latent space. If None, defaults to args.latent_dim
+        :param contrastive_temperature: temperature parameter for contrastive loss
+        :param smiles_vocab_size: size of SMILES vocabulary (required for decoder)
+        :param atom_vocab_size: size of atom vocabulary
+        :param bond_vocab_size: size of bond vocabulary
+        :param fg_size: size of functional group labels (default 85)
+        """
+        super(KermtHybridTask, self).__init__()
+        
+        # Store args for loss function
+        self.args = args
+        
+        # Shared encoder
+        self.kermt = kermt if kermt is not None else KERMTEmbedding(args)
+        self.embedding_output_type = args.embedding_output_type
+        
+        # CMIM components
+        self.latent_dist = KERMTLatentDistribution(args, kermt=self.kermt, latent_dim=latent_dim)
+        self.contrastive_temperature = contrastive_temperature
+        
+        # Validate vocab sizes
+        if smiles_vocab_size is None:
+            raise ValueError("smiles_vocab_size is required for KermtHybridTask")
+        if atom_vocab_size is None or bond_vocab_size is None:
+            raise ValueError("atom_vocab_size and bond_vocab_size are required for KermtHybridTask")
+        
+        # SMILES decoder for reconstruction
+        decoder_hidden_size = self.latent_dist.latent_dim
+        self.decoder = SMILESTransformerDecoder(
+            vocab_size=smiles_vocab_size,
+            hidden_size=decoder_hidden_size,
+            num_layers=args.decoder_num_layers,
+            num_attention_heads=args.decoder_num_attention_heads,
+            ffn_hidden_size=args.decoder_ffn_hidden_size,
+            dropout=args.decoder_dropout,
+            max_seq_len=args.decoder_max_seq_len,
+            pad_token_id=0,
+            positional_encoding=args.decoder_positional_encoding,
+            gate_self_attn=args.decoder_gate_self_attn,
+            gate_cross_attn=args.decoder_gate_cross_attn
+        )
+        
+        # Vocabulary prediction module
+        self.vocab_module = VocabPredictionModule(args, atom_vocab_size, bond_vocab_size, fg_size)
+        
+        # Get loss weight from args (default 1.0 means equal weight)
+        self.vocab_loss_weight = getattr(args, 'vocab_loss_weight', 1.0)
+    
+    def get_loss_func(self, args: Namespace) -> Callable:
+        """
+        The loss function generator for hybrid CMIM + vocab task.
+        
+        :param args: the arguments
+        :return: the loss function for KermtHybridTask
+        """
+        recon_loss_weight = args.reconstruction_loss_weight
+        normalize_gradient = args.normalize_gradient
+        normalize_loss = args.normalize_loss
+        compute_accuracy = args.tensorboard
+        dist_coff = args.dist_coff
+        vocab_loss_weight = self.vocab_loss_weight
+        
+        def loss_func(preds: Dict[str, torch.Tensor], targets: Dict = None):
+            """
+            The loss function for KermtHybridTask.
+            
+            :param preds: dictionary containing CMIM outputs and vocab predictions
+            :param targets: dictionary containing vocab targets (av_task, bv_task, fg_task)
+            :return: tuple of loss values for logging
+            """
+            # === CMIM Loss ===
+            mean = preds["mean"]
+            log_scale = preds["log_scale"]
+            z_latent = preds["z_latent"]
+            decoder_logits = preds["decoder_logits"]
+            decoder_target = preds["decoder_target"]
+            decoder_padding_mask = preds["decoder_padding_mask"]
+            
+            # Compute CMIM loss using module-level helper
+            loss_dict = compute_cmim_loss(
+                mean, log_scale, z_latent,
+                contrastive_temperature=self.contrastive_temperature,
+                normalize_gradient=normalize_gradient,
+                normalize_loss=normalize_loss
+            )
+            
+            cmim_loss = loss_dict["cmim_loss"]
+            log_p_k1_given_zx = loss_dict["log_p_k1_given_zx"]
+            log_q_z_given_x = loss_dict["log_q_z_given_x"]
+            log_P_z = loss_dict["log_P_z"]
+            
+            # Compute reconstruction loss
+            _, recon_loss_mean, _, recon_accuracy_mean = self.decoder.compute_reconstruction_loss(
+                logits=decoder_logits,
+                targets=decoder_target,
+                padding_mask=decoder_padding_mask,
+                compute_accuracy=compute_accuracy
+            )
+            
+            # CMIM total (contrastive + KL + reconstruction)
+            cmim_total = cmim_loss.mean() + recon_loss_weight * recon_loss_mean
+            
+            # === Vocab Loss ===
+            vocab_preds = preds["vocab_preds"]
+            vocab_overall, av_loss, bv_loss, fg_loss, av_dist_loss, bv_dist_loss, fg_dist_loss = \
+                VocabPredictionModule.compute_loss(vocab_preds, targets, dist_coff)
+            
+            # === Combined Loss ===
+            overall_loss = cmim_total + vocab_loss_weight * vocab_overall
+            
+            # Return all components for logging
+            # Order: (overall, cmim_total, recon, cmim_only, log_p_k1, log_q_z, log_P_z, recon_acc,
+            #         vocab_total, av, bv, fg, av_dist, bv_dist, fg_dist)
+            return (
+                overall_loss,
+                cmim_total,
+                recon_loss_mean,
+                cmim_loss.mean(),
+                log_p_k1_given_zx.mean(),
+                log_q_z_given_x.mean(),
+                log_P_z.mean(),
+                recon_accuracy_mean,
+                vocab_overall,
+                av_loss,
+                bv_loss,
+                fg_loss,
+                av_dist_loss,
+                bv_dist_loss,
+                fg_dist_loss
+            )
+        
+        return loss_func
+    
+    def forward(self, batch: Dict) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass for hybrid CMIM + vocab pretraining.
+        
+        :param batch: Dictionary containing:
+                      - 'graph_input': The batched graph for encoder
+                      - 'decoder_input': Token IDs for decoder input
+                      - 'decoder_target': Token IDs for reconstruction targets
+                      - 'decoder_padding_mask': Padding mask
+                      - 'causal_mask': Causal attention mask
+        :return: Dictionary containing CMIM outputs and vocab predictions
+        """
+        # Extract graph input
+        graph_batch = batch["graph_input"]
+        _, _, _, _, _, a_scope, b_scope, _ = graph_batch
+        a_scope_list = a_scope.data.cpu().numpy().tolist()
+        
+        # Get embeddings from shared encoder
+        embeddings = self.kermt(graph_batch)
+        
+        # === CMIM path ===
+        # Sample from latent distribution
+        z_latent, mean, log_scale = self.latent_dist.sample(graph_batch, return_params=True)
+        
+        # Decoder forward pass
+        memory = z_latent.unsqueeze(1)
+        decoder_input = batch["decoder_input"]
+        decoder_padding_mask = batch["decoder_padding_mask"]
+        causal_mask = batch["causal_mask"]
+        
+        decoder_logits = self.decoder(
+            decoder_input=decoder_input,
+            memory=memory,
+            tgt_mask=causal_mask,
+            tgt_key_padding_mask=decoder_padding_mask,
+            memory_key_padding_mask=None
+        )
+        
+        # === Vocab path ===
+        vocab_preds = self.vocab_module(embeddings, a_scope_list, b_scope)
+        
+        # Return combined output
+        return {
+            # CMIM outputs
+            "mean": mean,
+            "log_scale": log_scale,
+            "z_latent": z_latent,
+            "decoder_logits": decoder_logits,
+            "decoder_target": batch["decoder_target"],
+            "decoder_padding_mask": decoder_padding_mask,
+            # Vocab outputs
+            "vocab_preds": vocab_preds
         }
 
 
