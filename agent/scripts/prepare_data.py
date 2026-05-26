@@ -224,6 +224,43 @@ def _clean_smiles(
     return output_csv
 
 
+def _reduce_to_smiles_column(
+    csv_path: Path, smiles_column: int, manifest: dict[str, Any]
+) -> Path:
+    """Rewrite an inference CSV to keep only the SMILES column (at index 0).
+
+    Downstream `kermt.util.utils.get_data` -> `MoleculeDatapoint.__init__`
+    floats every column after SMILES, which crashes on non-numeric passthrough
+    columns (e.g. a 'split' label of 'train'/'val'/'test', or a 'Molecule Name'
+    string). Inference does not need target columns, so drop them here.
+    """
+    step_name = f"reduce_to_smiles_only({csv_path.name})"
+    start = time.time()
+    df = pd.read_csv(csv_path)
+    if df.shape[1] == 1:
+        manifest["steps"].append({
+            "name": step_name,
+            "output": str(csv_path),
+            "ok": True,
+            "duration_s": time.time() - start,
+            "skipped_due_to_existing": True,
+            "note": "already single-column",
+        })
+        return csv_path
+    effective_col = smiles_column if 0 <= smiles_column < df.shape[1] else 0
+    df.iloc[:, [effective_col]].to_csv(csv_path, index=False)
+    manifest["steps"].append({
+        "name": step_name,
+        "output": str(csv_path),
+        "ok": True,
+        "duration_s": time.time() - start,
+        "input_cols": int(df.shape[1]),
+        "kept_col": effective_col,
+        "kept_col_name": str(df.columns[effective_col]),
+    })
+    return csv_path
+
+
 def _save_features(
     csv_path: Path, npz_path: Path, generator: str, manifest: dict[str, Any], force: bool
 ) -> Path:
@@ -491,6 +528,10 @@ def _prepare_embed(args, out: Path, manifest: dict[str, Any]) -> None:
 def _prepare_inference(args, out: Path, manifest: dict[str, Any]) -> None:
     manifest["split_method"] = "n/a"
     clean = _clean_smiles(Path(args.csv), out / "clean.csv", args.smiles_column, manifest, args.force)
+    # Reduce to SMILES-only: downstream get_data/MoleculeDatapoint floats every
+    # non-SMILES column, which crashes on non-numeric passthrough columns
+    # (e.g. a 'split' label). Inference does not need target columns.
+    _reduce_to_smiles_column(clean, args.smiles_column, manifest)
     manifest["outputs"]["clean_csv"] = str(clean)
     if args.skip_features:
         manifest["steps"].append({"name": "save_features", "skipped_by_flag": True, "ok": True})

@@ -118,6 +118,11 @@ Let `$KERMT_REPO` be the path to your kermt repo checkout, and assume
   pretrain ckpt; use `kermt-finetune` first.
 - `prepare_data manifest reports ok=False` → check the manifest `errors` for
   the failed step (typically clean_smiles or save_features).
+- `could not convert string to float: '<value>'` from save_features or main.py
+  predict → input CSV has a non-numeric passthrough column (e.g. a 'split'
+  label). The prep step now strips the CSV to SMILES-only at inference; if
+  this error still surfaces, the CSV is being read by a runner that bypassed
+  prepare_data. Re-run via the skill, not `main.py` directly.
 - `--gpus '0,1' is single-GPU only` → pass a single id.
 
 ## Replayability
