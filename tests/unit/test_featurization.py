@@ -30,6 +30,11 @@ from kermt.data.molgraph import MolGraph, mol2graph
 from kermt.util.features import get_feature_range
 
 import cuik_molmaker
+from kermt.util._cuik_compat import (
+    atom_onehot_feature_names_to_tensor,
+    atom_float_feature_names_to_tensor,
+    bond_feature_names_to_tensor,
+)
 
 @pytest.mark.parametrize("bond_drop_rate", [0.0, 0.1, 0.2, 0.3])
 def test_cuik_molmaker_featurization(bond_drop_rate: float):
@@ -43,15 +48,15 @@ def test_cuik_molmaker_featurization(bond_drop_rate: float):
                         "ring-size",
                         ]
 
-    cmm_feature_arrays["atom_onehot"] = cuik_molmaker.atom_onehot_feature_names_to_array(atom_onehot_props)
-    atom_float_props = ["aromatic", "mass", 
+    cmm_feature_arrays["atom_onehot"] = atom_onehot_feature_names_to_tensor(atom_onehot_props)
+    atom_float_props = ["aromatic", "mass",
                         "hydrogen-bond-acceptor",
-                            "hydrogen-bond-donor", 
+                            "hydrogen-bond-donor",
                             "acidic", "basic"
                             ]
-    cmm_feature_arrays["atom_float"] = cuik_molmaker.atom_float_feature_names_to_array(atom_float_props)
+    cmm_feature_arrays["atom_float"] = atom_float_feature_names_to_tensor(atom_float_props)
     bond_props = ["is-null", "bond-type-onehot", "conjugated", "in-ring", "stereo"]
-    cmm_feature_arrays["bond"] = cuik_molmaker.bond_feature_names_to_array(bond_props)
+    cmm_feature_arrays["bond"] = bond_feature_names_to_tensor(bond_props)
 
     # Get feature ranges for cuik-molmaker
     cmm_feature_range = get_feature_range(atom_onehot_props, atom_float_props)

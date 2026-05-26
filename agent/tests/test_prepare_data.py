@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for agent/scripts/prepare_data.py.
 
 Runs the prepare_data CLI as a subprocess (the same way the agent skills will

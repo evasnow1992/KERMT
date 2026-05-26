@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for agent/scripts/run_pretrain_local.py.
 
 Exercises the argv builder + manifest writer via --dry-run. Synthetic ckpts +
@@ -127,7 +130,25 @@ def _make_validator_out(
             "activation": "PReLU", "backbone": "gtrans", "embedding_output_type": "both",
             "self_attention": False,
         },
-        "saved_args": {},
+        # cMIM/hybrid continue-pretrain reads decoder arch from saved_args
+        # (see CMIM_DECODER_FLAGS_FROM_CKPT in run_pretrain_local.py). Synthesize
+        # default-shaped values so the runner can build argv; tests that exercise
+        # the missing-field error path overwrite this block explicitly.
+        "saved_args": (
+            {
+                "latent_dim": 800,
+                "decoder_num_layers": 3,
+                "decoder_num_attention_heads": 8,
+                "decoder_ffn_hidden_size": 2048,
+                "decoder_dropout": 0.1,
+                "decoder_max_seq_len": 512,
+                "decoder_positional_encoding": "rope",
+                "decoder_gate_self_attn": False,
+                "decoder_gate_cross_attn": False,
+            }
+            if model_type in ("cmim", "hybrid")
+            else {}
+        ),
         "errors": [],
         "warnings": [],
     }

@@ -50,7 +50,7 @@ GPU presence + driver/CUDA version before any other skill is invoked.
 
 | Workflow | GPUs | VRAM per GPU | Disk | Typical wall time |
 |---|---|---|---|---|
-| `kermt-setup` | 1+ | — (validation only) | ~20 GB (kermt image) | ~10–20 min first build |
+| `kermt-setup` | 1+ | — (validation only) | ~50 GB (kermt image; see kermt-setup hardware notes) | ~10–20 min first build |
 | `kermt-continue-pretrain` | 1–N (auto-detected, DDP-aware) | ≥ 16 GB for batch_size 256, depth 6, hidden 800; falls back to batch_size 32 on 1 GPU | run dir ~tens of GB depending on corpus + epochs | hours to days |
 | `kermt-pretrain-scratch` | 1–N | same as continue-pretrain | same as continue-pretrain | **days even on multi-GPU** (no warm start) |
 | `kermt-add-cmim-pretrain` | 1–N | same as continue-pretrain | same | hours to days |
@@ -78,10 +78,16 @@ containing the ckpt itself plus its vocab files:
 ```
 <released_model>/
 ├── last_checkpoint.pt
-├── pretrain_atom_vocab.json
-├── pretrain_bond_vocab.json
-└── pretrain_smiles_vocab.pkl     # only for cmim / hybrid ckpts
+├── pretrain_atom_vocab.{json,pkl}    # either extension; pkl in current releases
+├── pretrain_bond_vocab.{json,pkl}    # either extension; pkl in current releases
+└── pretrain_smiles_vocab.pkl         # only for cmim / hybrid ckpts (pickle-only)
 ```
+
+If you're upgrading a grover_base ckpt to hybrid with
+[`kermt-add-cmim-pretrain`](skills/kermt-add-cmim-pretrain/SKILL.md), the
+upgrade step builds a fresh `pretrain_smiles_vocab.pkl` from your
+pretrain corpus — released bundles only ship the smiles vocab for
+already-cmim / already-hybrid ckpts.
 
 The vocab files are an inseparable part of the released model — the ckpt's
 vocab head dimensions are fixed at training time and only match these specific
@@ -158,7 +164,9 @@ done
 
 Restart Claude Code once after the first install so it picks up the new
 `~/.claude/skills/` entries. The symlinked form means future `git pull` updates
-to the skill content take effect without re-installing.
+to the skill content take effect without re-installing. If you ever rename a
+skill on disk (e.g. `kermt-foo` → `kermt-bar`), clean the stale entry first:
+`rm -rf ~/.claude/skills/kermt-foo` before re-running the snippet above.
 
 ### Codex
 
@@ -182,6 +190,66 @@ orchestration. Each `SKILL.md` lists the exact `python` commands it would
 run, and all scripts have `--help` output. Start by reading
 [`skills/kermt-setup/SKILL.md`](skills/kermt-setup/SKILL.md) for the container bootstrap,
 then the skill for the workflow you want.
+
+## Running a workflow
+
+The notes in this section apply to every workflow regardless of which agent
+(or human) is driving — they describe how the shared
+[`scripts/kermt_container.sh`](scripts/kermt_container.sh) helper that every
+SKILL.md invokes maps host paths into the container.
+
+### `KERMT_REPO` environment variable
+
+Every workflow step in every SKILL.md uses
+`$KERMT_REPO/agent/scripts/kermt_container.sh …` to bind-mount the repo at
+`/workspace` inside the docker container. The helper auto-derives
+`KERMT_REPO` from its own script path, so the default works for invocations
+made from inside the repo. **If you're running from an arbitrary directory,
+export it once** so every helper call picks it up:
+
+```bash
+export KERMT_REPO=/path/to/your/kermt
+```
+
+### Host-path → container-path bind-mount pattern
+
+All workflow commands use the same two-layer pattern:
+
+1. Pass the **host** path to `kermt_container.sh` via one of its mount flags:
+   - `--data <path>` (file or dir) → mounted at `/data` (file's parent if
+     `<path>` is a file)
+   - `--ckpt <path>` → mounted at `/ckpt` (path mounted as-is)
+   - `--vocab-dir <dir>` → mounted at `/vocab`
+   - `--run-dir <dir>` → mounted at `/runs` (read-write; created if absent)
+2. Reference the **container** mount path (`/data`, `/ckpt`, `/vocab`,
+   `/runs`) in the inner command passed after `--`.
+
+Mixing the two layers (e.g. passing the host path to the inner command,
+or omitting the helper flag entirely) will silently fail at file-not-found
+inside the container. When a file you need is already inside one of the
+mounted directories (e.g. an upgraded ckpt written to `$RUN_DIR/upgraded.pt`
+by a prior step), the `--run-dir` mount already exposes it as
+`/runs/upgraded.pt` — no separate `--ckpt` mount needed.
+
+### Single-GPU contention
+
+On a single-GPU host, launching two detached pretrain or finetune containers
+concurrently will serialize them via CUDA's per-process initialization
+(the second blocks on `cudaInit` until the first releases the device). Run
+them sequentially — kick off the second after `docker wait <first-name>` —
+or pass `--gpus` to assign them to distinct devices on a multi-GPU host.
+
+### Surface `warnings[]` from validators
+
+Both `check_checkpoint.py` and `check_data.py` emit a `warnings[]` array
+alongside `errors[]` and the boolean `ok`. The workflow SKILL.md steps
+tell the orchestrator to "abort on `ok: false`" — that handles `errors[]`.
+**Also pass `warnings[]` through to the user before proceeding** —
+warnings are non-blocking but often flag downstream failures (e.g. a
+CSV's SMILES column not being named `smiles` and being at a non-zero
+index; `prepare_data.py` auto-detects the index by header but the
+warning is still worth surfacing so the user can rename the column for
+clarity).
 
 ## Scripts (kernels)
 

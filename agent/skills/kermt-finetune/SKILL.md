@@ -52,9 +52,14 @@ Optional:
   splits. Either pass both or pass neither (the skill auto-splits using the
   configured `--split-type`).
 - `--split-type {random | scaffold_balanced | index_predetermined}` —
-  default `scaffold_balanced` from `defaults_finetune.json`. `random` and
-  `scaffold_balanced` are most common; `index_predetermined` requires
-  user-supplied per-fold index files (see `kermt/util/utils.split_data`).
+  default `scaffold_balanced` from `defaults_finetune.json`.
+  - `random` and `scaffold_balanced`: build the val/test split internally
+    from the train CSV. No `--val-csv` / `--test-csv` needed.
+  - `index_predetermined`: **requires** pre-split CSVs passed via
+    `--val-csv` + `--test-csv` (and, separately, per-fold index files —
+    see `kermt/util/utils.split_data`). Use this when the dataset ships
+    its own canonical split (e.g. `tests/data/Biogen_for_grover/scaffold/
+    balance/<endpoint>/{train,val,test}.csv`).
 - `--metric NAME` — `mae` (regression default), `auc` (classification default),
   or any name `kermt.util.metrics.get_metric_func` accepts.
 - `--epochs N` / `--batch-size N` / `--init-lr F` / `--max-lr F` /
@@ -112,6 +117,36 @@ helper bind-mounts them at known container paths.
    `ok: false`.
 
 5. **Prepare the data** (skip if `--from-prepare` given).
+
+   **Pre-flight: check for sibling val.csv / test.csv.** Before invoking
+   prepare_data, inspect the parent directory of `<user-csv>`. If a
+   canonical-looking sibling `val.csv` (or `val_*.csv` — common variants
+   include `val_T.csv`, `val_clean.csv`) AND a matching `test.csv` /
+   `test_*.csv` exist next to the train CSV, the dataset ships its own
+   pre-defined split. **In that case set `--split-type index_predetermined`
+   AND pass `--val-csv` / `--test-csv`** — otherwise the configured
+   `split_type` (default `scaffold_balanced`) will re-split the train CSV
+   from scratch and silently discard the user's val/test files. When in
+   doubt — or when the sibling files use non-canonical suffixes (`_T`,
+   `_v2`, etc.) — surface the situation to the user and ask which they
+   want.
+
+   **Quoting target names.** If any of the `--targets` column names
+   contain shell metacharacters (`>`, `&`, `|`, `(`, `)`, `$`, etc.),
+   single-quote each one when passing on the CLI to keep the shell from
+   eating part of the name. Example: `--targets 'Log_Caco2_Papp_A>B'
+   'logD'`. The CSV header itself is read directly by the downstream
+   trainer and is unaffected, but the prepare_data.json manifest's
+   `targets[]` field captures whatever the shell delivers — unquoted
+   metacharacters get truncated there.
+
+   **Mount note:** `kermt_container.sh --data <host-csv>` mounts the
+   parent directory of `<host-csv>` at `/data`. `--val-csv` and
+   `--test-csv` must therefore reference files in that same parent
+   directory. If val/test live in a separate directory (e.g. a sibling
+   `splits/` folder), mount the parent of all three using `--data <dir>`
+   on a directory rather than a file.
+
    ```
    $KERMT_REPO/agent/scripts/kermt_container.sh run --data <user-csv> --run-dir $RUN_DIR -- \
        "python agent/scripts/prepare_data.py --mode finetune \\
@@ -157,9 +192,15 @@ helper bind-mounts them at known container paths.
    - Log file: `$RUN_DIR/logs/finetune.log`
    - TensorBoard: `$RUN_DIR/logs/tb` (open with `tensorboard --logdir
      $RUN_DIR/logs/tb`)
-   - Final checkpoint will land at `$RUN_DIR/ckpt/fold_0/model_0/model.pt`
-     (path varies with `--num-folds` / `--ensemble-size`).
-   - Suggest invoking `kermt-monitor <RUN_DIR>` to check progress.
+   - Final checkpoints land at `$RUN_DIR/ckpt/fold_0/model_0/model.pt`
+     (best-val) and `last_checkpoint.pt` (sibling, auto-resume target).
+     Held-out test predictions + metrics land at
+     `$RUN_DIR/ckpt/fold_0/test_result.csv`. Paths vary with `--num-folds`
+     / `--ensemble-size`.
+   - To follow progress: `kermt-monitor <RUN_DIR>` (one-shot) or
+     `docker logs -f <container-name>` (streaming).
+   - To block until the run finishes (useful for short test runs):
+     `docker wait <container-name>` — prints the exit code on completion.
 
 ## Hard rules
 

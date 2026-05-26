@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Mode-dispatched data preparation pipeline for the KERMT agent skills.
 
 Composes the existing repo data-prep scripts (`scripts/clean_smiles.py`,
@@ -145,6 +148,60 @@ def _exists_nonempty(path: Path) -> bool:
 # ---------------------------------------------------------------------------
 # Per-script wrappers
 # ---------------------------------------------------------------------------
+
+def _resolve_smiles_column(csv_path: Path, explicit_value: int | None) -> int:
+    """Return the 0-based index of the SMILES column in csv_path.
+
+    Auto-detection rule when `explicit_value is None`:
+      1. Read the CSV header (first non-empty row).
+      2. Prefer an exact lowercase `smiles` column (kermt convention).
+      3. Otherwise accept a single case-insensitive match
+         (`SMILES`, `Smiles`, etc.).
+      4. If no match (or multiple ambiguous matches), raise a ValueError
+         that surfaces the header so the user can disambiguate via
+         `--smiles-column N`.
+
+    Real datasets routinely place SMILES at column index ≠ 0
+    (e.g. openadmet's all.csv has "Molecule Name" at col 0 and "SMILES"
+    at col 1). Auto-detection prevents the silent 0-row-clean failure
+    mode where every row gets rejected because col 0 doesn't parse as
+    a SMILES string.
+    """
+    if explicit_value is not None:
+        return explicit_value
+
+    if not csv_path.is_file():
+        raise ValueError(f"input CSV not found: {csv_path}")
+
+    import csv as _csv
+    with csv_path.open("r", newline="") as f:
+        reader = _csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise ValueError(f"input CSV {csv_path} is empty")
+
+    stripped = [c.strip() for c in header]
+    # Prefer exact lowercase "smiles"
+    exact = [i for i, c in enumerate(stripped) if c == "smiles"]
+    if exact:
+        return exact[0]
+    # Then case-insensitive
+    ci = [i for i, c in enumerate(stripped) if c.lower() == "smiles"]
+    if len(ci) == 1:
+        return ci[0]
+    if len(ci) > 1:
+        raise ValueError(
+            f"input CSV {csv_path} has multiple SMILES-named columns: "
+            f"{[header[i] for i in ci]} at indices {ci}. "
+            "Pass --smiles-column N (0-based) to disambiguate."
+        )
+    raise ValueError(
+        f"could not auto-detect a SMILES column in {csv_path}. "
+        f"Header columns: {header}. "
+        "Pass --smiles-column N (0-based) to specify which column holds SMILES."
+    )
+
 
 def _clean_smiles(
     input_csv: Path, output_csv: Path, smiles_column: int, manifest: dict[str, Any], force: bool
@@ -654,8 +711,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="(finetune only) target column names; forwarded to the finetune runner via the manifest")
     p.add_argument("--features-generator", default=None,
                    help="Override the per-mode default (pretrain: fgtasklabel; finetune/inference: rdkit_2d_normalized)")
-    p.add_argument("--smiles-column", type=int, default=0,
-                   help="0-based column index of SMILES in the input CSV (default 0)")
+    p.add_argument("--smiles-column", type=int, default=None,
+                   help="0-based column index of SMILES in the input CSV. "
+                        "When omitted, auto-detected by header name "
+                        "(prefers lowercase `smiles`; accepts case-insensitive "
+                        "`SMILES`/`Smiles`). Pass explicitly to override.")
     p.add_argument("--force", action="store_true",
                    help="Re-run every step even if its outputs already exist")
     p.add_argument("--skip-clean", action="store_true", help="(embed mode) skip the cleaning step")
@@ -668,6 +728,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "finetune" and args.targets:
         pass  # captured in manifest below
 
+    # Resolve the SMILES column index (auto-detect from header when the user
+    # didn't pass --smiles-column). This is the only point where args.csv is
+    # touched before downstream _clean_smiles calls fan it out.
+    try:
+        resolved_smiles_col = _resolve_smiles_column(Path(args.csv), args.smiles_column)
+    except ValueError as exc:
+        err_manifest = {
+            "ok": False,
+            "mode": args.mode,
+            "errors": [f"smiles-column resolution failed: {exc}"],
+        }
+        Path(args.out).mkdir(parents=True, exist_ok=True)
+        (Path(args.out) / "prepare_data.json").write_text(json.dumps(err_manifest, indent=2))
+        print(json.dumps(err_manifest, indent=2))
+        return 1
+    if args.smiles_column is None:
+        print(f"[prepare_data] auto-detected --smiles-column {resolved_smiles_col} "
+              f"from {Path(args.csv).name} header", file=sys.stderr)
+    args.smiles_column = resolved_smiles_col
+
     try:
         manifest = prepare(args)
     except Exception as exc:  # noqa: BLE001
@@ -676,7 +756,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.targets:
         manifest["targets"] = list(args.targets)
-        (Path(args.out) / "prepare_data.json").write_text(json.dumps(manifest, indent=2))
+    # Record the resolved SMILES column so the manifest is self-describing.
+    manifest["smiles_column"] = args.smiles_column
+    (Path(args.out) / "prepare_data.json").write_text(json.dumps(manifest, indent=2))
     print(json.dumps(manifest, indent=2))
     return 0 if manifest.get("ok") else 1
 

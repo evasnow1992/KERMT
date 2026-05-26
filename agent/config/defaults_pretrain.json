@@ -24,8 +24,8 @@
   },
 
   "add_cmim_decoder": {
-    "_about": "Used by kermt-add-cmim-pretrain when constructing the new cMIM decoder + latent_dist on top of a loaded grover-base encoder. Ignored by kermt-continue-pretrain (these dimensions come from the ckpt's saved_args). Values match the manuscript's hybrid pretrain configuration.",
-    "latent_dim": 800,
+    "_about": "Used by kermt-add-cmim-pretrain when constructing the new cMIM decoder + latent_dist on top of a loaded grover-base encoder, and by kermt-pretrain-scratch when the pretrain target is cmim or hybrid. Ignored by kermt-continue-pretrain (those dimensions come from the ckpt's saved_args). Values match the manuscript's hybrid pretrain configuration: latent_dim=512, 8-head, 3-layer decoder (cf. `_PRESET_LATENT_DIM` / `_PRESET_DECODER_FFN_HIDDEN_SIZE` in launch-KERMT-pretrain-slurm.sh, both presets).",
+    "latent_dim": 512,
     "contrastive_temperature": 0.1,
     "decoder_num_layers": 3,
     "decoder_num_attention_heads": 8,

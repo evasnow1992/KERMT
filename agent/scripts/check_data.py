@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Validate a CSV input for a given KERMT agent workflow.
 
 Mode-dispatched. Emits a single JSON object to stdout that the calling skill

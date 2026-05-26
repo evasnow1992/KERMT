@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for agent/scripts/check_data.py.
 
 Mix of synthetic CSV fixtures (full control of edge cases) and a few real

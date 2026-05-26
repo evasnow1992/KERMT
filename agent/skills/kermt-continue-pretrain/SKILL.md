@@ -165,12 +165,20 @@ host; the helper bind-mounts them at known container paths.
    would silently mismatch the ckpt's vocab heads (the ckpt's vocab is
    authoritative for continue-pretrain).
 
+   Note the **two-layer mount pattern**: pass the host directory to
+   `kermt_container.sh --vocab-dir` (which mounts it at `/vocab` inside the
+   container), and reference `/vocab` from the inner `prepare_data.py`
+   command. The same pattern applies to every host path the inner command
+   needs to read (`--data <host-csv>` → `/data/<basename>`,
+   `--ckpt <host-ckpt>` → `/ckpt`).
+
    ```
    VOCAB_DIR=$(dirname <user-ckpt>)
-   $KERMT_REPO/agent/scripts/kermt_container.sh run --data <user-csv> --run-dir $RUN_DIR -- \
+   $KERMT_REPO/agent/scripts/kermt_container.sh run \
+       --data <user-csv> --vocab-dir $VOCAB_DIR --run-dir $RUN_DIR -- \
        "python agent/scripts/prepare_data.py --mode pretrain \\
             --csv /data/<basename> --out /runs/data \\
-            --vocab-dir $VOCAB_DIR \\
+            --vocab-dir /vocab \\
             [--val-csv /data/<val-basename>] [--val-frac 0.1] [--seed 0]"
    ```
    Outputs land at `$RUN_DIR/data/prepare_data.json` with

@@ -25,9 +25,11 @@ after the Dockerfile or `environment.yml` changes) before invoking any other
   must support CUDA 12.6. Verify with host `nvidia-smi` before invoking.
 - **Host docker**: docker engine + nvidia-container-toolkit. Without the
   toolkit, `docker run --gpus all` will fail at step 2 of the workflow below.
-- **Disk**: ≈ 20 GB free for the built kermt image (real `.Size` is ≈ 16 GB;
-  buildx attestation manifests can push the `docker images` display value
-  higher without actual extra disk use).
+- **Disk**: ≈ 50 GB free for the built kermt image (`docker image inspect
+  --format '{{.Size}}'` reports ≈ 44 GB; the `docker images` Size column
+  can show ~100 GB because it counts shareable buildx attestation layers
+  that are deduplicated across images). Plan for ~50 GB of unique on-disk
+  storage; add a comfortable buffer if you're also keeping build cache.
 - **Memory**: the build itself peaks at ~4 GB RAM during conda env solve.
 - This skill does not run training/inference workloads itself; per-workflow
   hardware requirements (VRAM, GPU count) are declared in the respective
@@ -89,9 +91,12 @@ Let `HELPER=$KERMT_REPO/agent/scripts/kermt_container.sh`.
    logs to the console. Do not run this in the background — the user wants to
    see progress and any build failures must surface immediately.
 
-4. **GPU smoke test inside the container.**
+4. **GPU smoke test inside the container.** Quote the whole `python` command
+   as a single string — the helper passes args through `bash -c "$*"`, so
+   unquoted multi-word commands get re-parsed and any embedded quotes are
+   collapsed.
    ```
-   $HELPER run -- python -c "import torch; print('cuda_available:', torch.cuda.is_available()); print('device_count:', torch.cuda.device_count())"
+   $HELPER run -- 'python -c "import torch; print(\"cuda_available:\", torch.cuda.is_available()); print(\"device_count:\", torch.cuda.device_count())"'
    ```
    Expected output: `cuda_available: True` and a positive `device_count`. If
    `cuda_available` is `False` despite step 2 passing, something is wrong with

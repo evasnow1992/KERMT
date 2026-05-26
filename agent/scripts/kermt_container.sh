@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # kermt_container.sh — bootstrap helper for the kermt agent skills.
 #
 # Two ways to use this file:
@@ -21,8 +24,11 @@
 #   KERMT_GPUS    value passed to docker --gpus (default: all)
 #
 # Mount flags accepted by kermt_run / kermt_run_detached:
-#   --data <path>       bind to /data    (read-only)
-#   --ckpt <path>       bind to /ckpt    (read-only)
+#   --data <path>       bind to /data    (read-only). If <path> is a file,
+#                       its PARENT directory is mounted at /data so
+#                       commands can use /data/<basename>; if <path> is a
+#                       directory, it is mounted at /data directly.
+#   --ckpt <path>       bind to /ckpt    (read-only; the path is mounted as-is)
 #   --vocab-dir <dir>   bind to /vocab   (read-only)
 #   --run-dir <dir>     bind to /runs    (read-write; created on host if missing)
 #
@@ -212,6 +218,9 @@ kermt_check_gpu() {
 kermt_ensure_image() {
   kermt_check_docker || return $?
   if docker image inspect "$KERMT_IMAGE" >/dev/null 2>&1; then
+    local id
+    id=$(docker image inspect "$KERMT_IMAGE" --format '{{.Id}}' 2>/dev/null | cut -c1-19)
+    echo "[kermt] image '$KERMT_IMAGE' already present (${id:-unknown})"
     return 0
   fi
   echo "[kermt] image '$KERMT_IMAGE' not found; building from $KERMT_REPO/Dockerfile"
@@ -238,7 +247,15 @@ _kermt_parse_mounts() {
         ;;
       --data)
         [[ -e "$2" ]] || { echo "[kermt] --data path not found: $2" >&2; return 1; }
-        _out+=("-v" "$(realpath "$2"):/data:ro")
+        # If the user passes a file, mount its parent directory at /data so
+        # downstream commands can refer to /data/<basename>. Mounting a
+        # single file at /data makes the path-as-directory pattern in the
+        # skill examples (`--csv /data/<basename>`) fail with "not found".
+        if [[ -d "$2" ]]; then
+          _out+=("-v" "$(realpath "$2"):/data:ro")
+        else
+          _out+=("-v" "$(realpath "$(dirname "$2")"):/data:ro")
+        fi
         shift 2; _kermt_consumed=$((_kermt_consumed + 2))
         ;;
       --ckpt)
@@ -278,7 +295,10 @@ _kermt_git_env_flags() {
   if command -v git >/dev/null 2>&1 && [[ -d "$KERMT_REPO/.git" ]]; then
     local c
     c=$(git -C "$KERMT_REPO" rev-parse HEAD 2>/dev/null) && commit="$c"
-    if [[ -n "$(git -C "$KERMT_REPO" status --porcelain 2>/dev/null | head -n 1)" ]]; then
+    # `--untracked-files=no` filters out user-private notes (e.g. a CLAUDE.md
+    # or RELEASE_PLAN_v2.0.md at the repo root) that wouldn't affect
+    # reproducibility — only modifications to tracked files do.
+    if [[ -n "$(git -C "$KERMT_REPO" status --porcelain --untracked-files=no 2>/dev/null | head -n 1)" ]]; then
       dirty="true"
     fi
   fi
@@ -302,10 +322,12 @@ kermt_run() {
   local git_args=()
   while IFS= read -r line; do git_args+=("$line"); done < <(_kermt_git_env_flags)
   docker run --rm --gpus "$KERMT_GPUS" \
+    --user "$(id -u):$(id -g)" \
     -v "$KERMT_REPO:/workspace" \
     "${mount_args[@]}" \
     -w /workspace \
     -e PYTHONPATH=/workspace \
+    -e HOME=/tmp/kermt-home \
     "${git_args[@]}" \
     "$KERMT_IMAGE" \
     conda run -n kermt --no-capture-output bash -c "$*"
@@ -342,17 +364,20 @@ kermt_run_detached() {
   local git_args=()
   while IFS= read -r line; do git_args+=("$line"); done < <(_kermt_git_env_flags)
   cid=$(docker run -d --gpus "$KERMT_GPUS" \
+    --user "$(id -u):$(id -g)" \
     --name "$name" \
     -v "$KERMT_REPO:/workspace" \
     "${mount_args[@]}" \
     -w /workspace \
     -e PYTHONPATH=/workspace \
+    -e HOME=/tmp/kermt-home \
     "${git_args[@]}" \
     "$KERMT_IMAGE" \
     conda run -n kermt --no-capture-output bash -c "$*") || return $?
   echo "[kermt] container started: name=$name id=$cid"
-  echo "[kermt] follow logs: docker logs -f $name"
-  echo "[kermt] stop:         docker stop $name"
+  echo "[kermt] follow logs:    docker logs -f $name"
+  echo "[kermt] wait for exit:  docker wait $name"
+  echo "[kermt] stop:           docker stop $name"
   echo "$cid"
 }
 

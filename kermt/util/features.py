@@ -37,6 +37,11 @@
 from dataclasses import dataclass
 import numpy as np
 import cuik_molmaker
+from kermt.util._cuik_compat import (
+    atom_onehot_feature_names_to_tensor,
+    atom_float_feature_names_to_tensor,
+    EMPTY_FLOAT_TENSOR,
+)
 
 
 @dataclass
@@ -54,17 +59,17 @@ def get_feature_range(atom_props_onehot, atom_props_float):
     
     # Get ranges for one-hot encoded features
     for atom_prop in atom_props_onehot:
-        atom_prop_array = cuik_molmaker.atom_onehot_feature_names_to_array([atom_prop])
-        atom_feats_cmm, _, _, _, _ = cuik_molmaker.mol_featurizer(smi, atom_prop_array, 
-            np.array([]), np.array([]), False, False, True, False)
+        atom_prop_array = atom_onehot_feature_names_to_tensor([atom_prop])
+        atom_feats_cmm, _, _, _, _ = cuik_molmaker.mol_featurizer(smi, atom_prop_array,
+            EMPTY_FLOAT_TENSOR, EMPTY_FLOAT_TENSOR, False, False, True, False)
         feature_ranges[atom_prop] = FeatureRange(feature_start_idx, feature_start_idx + atom_feats_cmm.shape[1])
         feature_start_idx += atom_feats_cmm.shape[1]
-    
+
     # Get ranges for float features
     for atom_prop in atom_props_float:
-        atom_prop_array = cuik_molmaker.atom_float_feature_names_to_array([atom_prop])
-        atom_feats_cmm, _, _, _, _ = cuik_molmaker.mol_featurizer(smi, np.array([]), 
-            atom_prop_array, np.array([]), False, False, True, False)
+        atom_prop_array = atom_float_feature_names_to_tensor([atom_prop])
+        atom_feats_cmm, _, _, _, _ = cuik_molmaker.mol_featurizer(smi, EMPTY_FLOAT_TENSOR,
+            atom_prop_array, EMPTY_FLOAT_TENSOR, False, False, True, False)
         feature_ranges[atom_prop] = FeatureRange(feature_start_idx, feature_start_idx + atom_feats_cmm.shape[1])
         feature_start_idx += atom_feats_cmm.shape[1]
     

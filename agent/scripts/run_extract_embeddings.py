@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Workstation embedding-extraction runner — wraps task/extract_embeddings.py
 and emits a reproducible `run.json` manifest alongside the outputs.
 

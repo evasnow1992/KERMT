@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Workstation finetune runner — composes prepare_data + check_checkpoint outputs
 into a `main.py finetune` invocation (which calls task/cross_validate.py).
 

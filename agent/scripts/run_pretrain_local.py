@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Workstation pretrain runner — composes prepare_data + ckpt-validator outputs
 into a pretrain_ddp.py invocation.
 
@@ -77,11 +80,39 @@ TRAINING_FLAGS = (
     "use_cuikmolmaker_featurization",
 )
 LOSS_FLAGS = ("contrastive_temperature", "vocab_loss_weight")
-DECODER_FLAGS = ("latent_dim",)
+DECODER_FLAGS = (
+    "latent_dim",
+    "decoder_num_layers",
+    "decoder_num_attention_heads",
+    "decoder_ffn_hidden_size",
+    "decoder_dropout",
+    "decoder_max_seq_len",
+    "decoder_positional_encoding",
+    "decoder_gate_self_attn",
+    "decoder_gate_cross_attn",
+)
 
 ARCH_FLAGS_FROM_CKPT = (
     "hidden_size", "depth", "num_attn_head", "activation", "backbone",
     "embedding_output_type", "self_attention",
+)
+
+# cMIM-decoder + latent-distribution arch fields. For continue-pretrain on a
+# cmim/hybrid ckpt these MUST come from the ckpt's saved_args (so the model
+# being constructed matches the ckpt's weights at load time); the
+# defaults_pretrain.json `add_cmim_decoder` block is for add-cmim-pretrain's
+# upgrade-time decoder construction only, and is intentionally ignored
+# during continue-pretrain.
+CMIM_DECODER_FLAGS_FROM_CKPT = (
+    "latent_dim",
+    "decoder_num_layers",
+    "decoder_num_attention_heads",
+    "decoder_ffn_hidden_size",
+    "decoder_dropout",
+    "decoder_max_seq_len",
+    "decoder_positional_encoding",
+    "decoder_gate_self_attn",
+    "decoder_gate_cross_attn",
 )
 
 
@@ -191,8 +222,21 @@ def _build_argv(
         argv += ["--vocab_loss_weight", str(applied["vocab_loss_weight"]["value"])]
     if "contrastive_temperature" in applied and model_type in ("cmim", "hybrid"):
         argv += ["--contrastive_temperature", str(applied["contrastive_temperature"]["value"])]
-    if "latent_dim" in applied and model_type in ("cmim", "hybrid"):
-        argv += ["--latent_dim", str(applied["latent_dim"]["value"])]
+    # cMIM/decoder arch: emit every applied flag. For continue-pretrain on a
+    # cmim/hybrid ckpt, every entry will be source="ckpt_saved_args" (see the
+    # overlay loop in run()). For pretrain-from-scratch / add-cmim-pretrain
+    # the values come from defaults_pretrain.json's add_cmim_decoder block.
+    if model_type in ("cmim", "hybrid"):
+        for f in ("latent_dim", "decoder_num_layers", "decoder_num_attention_heads",
+                  "decoder_ffn_hidden_size", "decoder_dropout",
+                  "decoder_max_seq_len", "decoder_positional_encoding"):
+            if f in applied:
+                argv += [f"--{f}", str(applied[f]["value"])]
+        # Boolean store_true flags: emit the bare flag only when True.
+        if applied.get("decoder_gate_self_attn", {}).get("value"):
+            argv += ["--decoder_gate_self_attn"]
+        if applied.get("decoder_gate_cross_attn", {}).get("value"):
+            argv += ["--decoder_gate_cross_attn"]
 
     # Architecture — sourced from validator's arch block, never from CLI/defaults.
     argv += [
@@ -489,6 +533,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "--init-lr / --max-lr / --final-lr explicitly."
             )
         for f in SCHEDULE_FLAGS:
+            applied[f] = {"value": saved_args[f], "source": "ckpt_saved_args"}
+
+    # Continue-pretrain on a cmim/hybrid ckpt: cMIM/decoder arch must come
+    # from the ckpt's saved_args, not from defaults or CLI. This is the
+    # cmim/decoder analogue of the encoder-arch passthrough already done by
+    # `_arch_from_validator` (and matches the README guarantee that
+    # `add_cmim_decoder` defaults are ignored during continue-pretrain).
+    if not from_scratch and model_type in ("cmim", "hybrid"):
+        cli_latent_dim_override = args.latent_dim is not None
+        if cli_latent_dim_override:
+            raise ValueError(
+                "--latent-dim cannot be overridden during continue-pretrain on a "
+                "cmim/hybrid ckpt — the value is fixed by the ckpt's saved_args "
+                "(passing a different value would mismatch the loaded decoder "
+                "weights). Drop --latent-dim, or use kermt-pretrain-scratch if "
+                "you intentionally want a different latent dimension."
+            )
+        saved_args = validator_out.get("saved_args") or {}
+        cmim_missing = [f for f in CMIM_DECODER_FLAGS_FROM_CKPT if f not in saved_args]
+        if cmim_missing:
+            raise ValueError(
+                f"continue-pretrain on a {model_type} ckpt requires the ckpt's "
+                f"saved_args to include cmim/decoder arch fields, but these are "
+                f"missing: {cmim_missing}. The ckpt was saved without enough "
+                "metadata to faithfully reconstruct the decoder."
+            )
+        for f in CMIM_DECODER_FLAGS_FROM_CKPT:
             applied[f] = {"value": saved_args[f], "source": "ckpt_saved_args"}
 
     # 5. Build the pretrain_ddp.py argv.

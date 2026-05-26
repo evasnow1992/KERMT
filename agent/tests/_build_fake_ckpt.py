@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Test utility: build a fake grover_base (vocab-only) checkpoint whose vocab
 heads match a given pair of atom + bond vocab files.
 

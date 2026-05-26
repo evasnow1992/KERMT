@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for agent/scripts/check_checkpoint.py.
 
 Builds synthetic minimal checkpoint dicts that mirror the save_model_for_restart

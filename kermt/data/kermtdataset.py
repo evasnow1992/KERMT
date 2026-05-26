@@ -26,6 +26,11 @@ from kermt.data.task_labels import atom_to_vocab, bond_to_vocab
 from kermt.util.features import get_feature_range
 
 import cuik_molmaker
+from kermt.util._cuik_compat import (
+    atom_onehot_feature_names_to_tensor,
+    atom_float_feature_names_to_tensor,
+    bond_feature_names_to_tensor,
+)
 
 
 # ============================================================================
@@ -57,13 +62,13 @@ def setup_cuik_molmaker_features(args):
     ]
     bond_props = ["is-null", "bond-type-onehot", "conjugated", "in-ring", "stereo"]
     
-    # Form feature arrays. cuik_molmaker 0.2 renamed these from
-    # `_feature_names_to_tensor` to `_feature_names_to_array`; commit 3aedca8
-    # adopted the new API in molgraph.py + features.py but missed this site.
+    # Form feature arrays via the version-agnostic compat shim
+    # (kermt:latest container ships the post-0.2 `_to_tensor` rename;
+    # admet_dev_py311 host conda env still ships 0.2 with `_to_array`).
     cmm_feature_tensors = {
-        "atom_onehot": cuik_molmaker.atom_onehot_feature_names_to_array(atom_onehot_props),
-        "atom_float": cuik_molmaker.atom_float_feature_names_to_array(atom_float_props),
-        "bond": cuik_molmaker.bond_feature_names_to_array(bond_props)
+        "atom_onehot": atom_onehot_feature_names_to_tensor(atom_onehot_props),
+        "atom_float": atom_float_feature_names_to_tensor(atom_float_props),
+        "bond": bond_feature_names_to_tensor(bond_props),
     }
     
     # Get feature ranges

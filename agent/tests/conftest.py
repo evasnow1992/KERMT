@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Pytest configuration for agent/tests/.
 
 Registers the `slow` marker for tests that take more than a few seconds (e.g.

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for agent/scripts/upgrade_to_hybrid.py.
 
 Builds synthetic grover_base ckpts (modern `kermt.encoders.*` prefix AND legacy

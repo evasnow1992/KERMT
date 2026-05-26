@@ -53,6 +53,12 @@ import torch
 from cuik_molmaker.mol_features import MoleculeFeaturizer
 from descriptastorus.descriptors import rdDescriptors, rdNormalizedDescriptors
 from kermt.util.features import FeatureRange, get_feature_range
+from kermt.util._cuik_compat import (
+    atom_onehot_feature_names_to_tensor,
+    atom_float_feature_names_to_tensor,
+    bond_feature_names_to_tensor,
+    to_float_tensor,
+)
 
 # Atom feature sizes
 MAX_ATOMIC_NUM = 100
@@ -477,8 +483,8 @@ def mol2graph(smiles_batch: List[str], shared_dict,
         add_h, offset_carbon, duplicate_edges, add_self_loop = False, False, True, False
         batch_feats = cuik_molmaker.batch_mol_featurizer(smiles_batch, atom_props_onehot_array, atom_props_float_array, bond_props_array, add_h, offset_carbon, duplicate_edges, add_self_loop)
         atom_feats_cmm, bond_feats_cmm, _, _, _ = batch_feats
-        atom_feats_cmm = torch.from_numpy(atom_feats_cmm).float()
-        bond_feats_cmm = torch.from_numpy(bond_feats_cmm).float()
+        atom_feats_cmm = to_float_tensor(atom_feats_cmm)
+        bond_feats_cmm = to_float_tensor(bond_feats_cmm)
 
         # For atomic features, cuik-molmaker always returns one-hot encoded features first followed by float features
         # We need to rearrange the features to match the order of the features expected by KERMT model
@@ -535,15 +541,15 @@ class MolCollator(object):
                                 "ring-size",
                                 ]
 
-            self.cmm_feature_arrays["atom_onehot"] = cuik_molmaker.atom_onehot_feature_names_to_array(atom_onehot_props)
-            atom_float_props = ["aromatic", "mass", 
+            self.cmm_feature_arrays["atom_onehot"] = atom_onehot_feature_names_to_tensor(atom_onehot_props)
+            atom_float_props = ["aromatic", "mass",
                                 "hydrogen-bond-acceptor",
-                                    "hydrogen-bond-donor", 
+                                    "hydrogen-bond-donor",
                                     "acidic", "basic"
                                     ]
-            self.cmm_feature_arrays["atom_float"] = cuik_molmaker.atom_float_feature_names_to_array(atom_float_props)
+            self.cmm_feature_arrays["atom_float"] = atom_float_feature_names_to_tensor(atom_float_props)
             bond_props = ["is-null", "bond-type-onehot", "conjugated", "in-ring", "stereo"]
-            self.cmm_feature_arrays["bond"] = cuik_molmaker.bond_feature_names_to_array(bond_props)
+            self.cmm_feature_arrays["bond"] = bond_feature_names_to_tensor(bond_props)
 
             # Get feature ranges for cuik-molmaker
             self.cmm_feature_range = get_feature_range(atom_onehot_props, atom_float_props)

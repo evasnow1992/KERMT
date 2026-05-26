@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Convert a grover_base ckpt into a hybrid ckpt by adding a
 randomly-initialized cMIM decoder + latent_dist on top of the loaded encoder.
 
@@ -313,19 +316,16 @@ def upgrade(args: argparse.Namespace) -> dict[str, Any]:
             "likely arch drift between legacy GROVER and modern KERMTEmbedding."
         )
 
-    # Surface a known limitation: pretrain_ddp.py's --backbone argparse choices
-    # is currently `["gtrans"]` only (kermt/util/parsing.py:379), even though
-    # the model code itself handles "dualtrans" too (kermt/model/models.py:200).
-    # The upgraded ckpt is valid, but the downstream continue-pretrain runner
-    # would hit the argparse restriction. Surface this clearly so the user
-    # knows what to expect.
-    if getattr(new_args, "backbone", None) not in (None, "gtrans"):
+    # Surface unknown backbones (anything beyond the gtrans/dualtrans pair
+    # that pretrain_ddp.py's argparse + the model code both accept). The
+    # legacy `dualtrans` name is the same architecture as `gtrans` and is
+    # explicitly handled in kermt/model/models.py:200.
+    if getattr(new_args, "backbone", None) not in (None, "gtrans", "dualtrans"):
         summary["warnings"].append(
-            f"upgraded ckpt has backbone='{new_args.backbone}' which the model code supports "
-            "but pretrain_ddp.py's --backbone argparse choices currently restricts to "
-            "['gtrans']. To continue-pretrain this ckpt, either (a) relax parsing.py:379 "
-            "choices to include the legacy backbone, or (b) re-pretrain a modern gtrans "
-            "grover_base from scratch via kermt-pretrain-scratch."
+            f"upgraded ckpt has backbone='{new_args.backbone}', which is neither "
+            "'gtrans' nor 'dualtrans'. pretrain_ddp.py's --backbone argparse will reject "
+            "it. Either re-pretrain a gtrans grover_base from scratch via "
+            "kermt-pretrain-scratch, or extend the parsing.py:379 choices."
         )
 
     # 9. Build a fresh Adam optimizer over the new model (matches save_checkpoint format).

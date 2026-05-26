@@ -94,9 +94,11 @@ Let `$KERMT_REPO` be the path to your kermt repo checkout.
 7. **Report to the user.**
    - Embeddings directory: `$RUN_DIR/out/`
      - `atom_from_atom.npy`, `bond_from_atom.npy`,
-       `atom_from_bond.npy`, `bond_from_bond.npy` (the 4 standard readouts)
-     - `canonical_smiles.npy` (RDKit-canonicalized SMILES per row)
-     - `validity.npy` (boolean per-row: did RDKit parse it)
+       `atom_from_bond.npy`, `bond_from_bond.npy` (the 4 standard readouts;
+       each shape `(N_rows, hidden_size)`)
+     - `metadata.pkl` — pickle of a dict containing `canonical_smiles`
+       (RDKit-canonicalized SMILES per row), `valid` (boolean per-row: did
+       RDKit parse it), plus other run metadata.
    - Manifest: `$RUN_DIR/run.json`
    - Log: `$RUN_DIR/logs/embed.log`
 

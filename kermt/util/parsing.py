@@ -376,8 +376,10 @@ def add_pretrain_args(parser: ArgumentParser):
                              'Total loss = CMIM_loss + vocab_loss_weight * vocab_loss. Default: 1.0')
     
     # ========== Encoder Model Arguments ==========
-    parser.add_argument("--backbone", default="gtrans", choices=["gtrans"],
-                        help="Encoder backbone architecture.")
+    parser.add_argument("--backbone", default="gtrans", choices=["gtrans", "dualtrans"],
+                        help="Encoder backbone architecture. `dualtrans` is the legacy "
+                             "name for the same architecture, kept for compatibility with "
+                             "older grover_base checkpoints.")
     parser.add_argument('--embedding_output_type', type=str, default='both', nargs='?',
                         choices=("atom", "bond", "both"),
                         help="Type of output embeddings from encoder. Options: atom, bond, both")
