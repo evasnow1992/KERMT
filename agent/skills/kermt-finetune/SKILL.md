@@ -170,7 +170,19 @@ helper bind-mounts them at known container paths.
      `"Filling from defaults_finetune.json: epochs=30, batch_size=32,
        split_type=scaffold_balanced. Override any of these with --<flag>."`
 
-7. **Launch the runner detached.** (Consistent with the pretrain skills.)
+7. **Targets confirmation gate (hard requirement).** Before launching the
+   runner, regardless of how the targets list was determined (CLI `--targets`,
+   auto-detection in step 4, or a user natural-language request like
+   "finetune on Caco2 and HLM"), echo the final targets list to the user with
+   an explicit count:
+   `"Will finetune on N target(s): COL1, COL2, ..."`. If the user's request
+   specified a subset that doesn't match this list (e.g., they asked for 2
+   tasks via natural language but the list still has 4), treat it as a
+   discrepancy and re-prompt with the diff — never silently proceed on the
+   wrong target set. Wait for explicit confirmation before launching unless
+   `--yes` was given.
+
+8. **Launch the runner detached.** (Consistent with the pretrain skills.)
    ```
    $KERMT_REPO/agent/scripts/kermt_container.sh run_detached \\
        --name kermt-finetune-<ts> \\
@@ -186,7 +198,7 @@ helper bind-mounts them at known container paths.
    ```
    Returns the container name + id + log file path.
 
-8. **Report to the user.** Output a short summary:
+9. **Report to the user.** Output a short summary:
    - Container name + id
    - `$RUN_DIR/run.json` (manifest with cmd_replay + image digest)
    - Log file: `$RUN_DIR/logs/finetune.log`
@@ -212,7 +224,7 @@ helper bind-mounts them at known container paths.
   `self_attention` (+ `attn_hidden` / `attn_out` when applicable) from the
   ckpt's saved_args. There is no `--hidden-size` flag on this runner.
 - **Never block on the long-running finetune.** The skill launches via
-  `run_detached` and returns immediately after step 8. Use `kermt-monitor`.
+  `run_detached` and returns immediately after step 9. Use `kermt-monitor`.
 - **Echo applied defaults back to the user.** The `args_applied` field of
   `run.json` records every flag's value + source (user / default-config).
   Surface a one-line summary of every filled-from-default flag so the user

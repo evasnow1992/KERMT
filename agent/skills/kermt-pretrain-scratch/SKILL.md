@@ -27,8 +27,22 @@ Same as `kermt-continue-pretrain`:
 - **GPUs**: 1–N CUDA-capable. The runner auto-detects via
   `torch.cuda.device_count()`; `--gpus 0,2` overrides. Single-GPU fallback:
   `--batch_size 32 --save_interval 500`. Multi-GPU keeps defaults
-  (`--batch_size 256` etc.).
-- **VRAM**: ≥ 16 GB per GPU for the default `depth 6 / hidden 800 / batch 256`.
+  (`--batch_size 256` etc.). Note: `--gpus N` uses **torch.cuda** indexing,
+  which can differ from `nvidia-smi`'s display order on multi-GPU hosts
+  (PCI bus vs. CUDA enumeration). To target a specific physical GPU, set
+  `CUDA_VISIBLE_DEVICES` before invoking, or run
+  `python -c "import torch; print([torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])"`
+  to confirm which device you're picking.
+- **VRAM**: the default `--batch-size 256` is sized for A100-class hardware
+  (80 GB VRAM). On smaller GPUs, downscale to avoid OOM:
+
+  | GPU class                | VRAM       | Suggested `--batch-size` |
+  |--------------------------|------------|--------------------------|
+  | L4, T4, V100 16 GB       | 16–24 GB   | 32–64                    |
+  | A100 40 GB, L40, A40     | 40–48 GB   | 128                      |
+  | A100 80 GB, H100, H200   | 80 GB      | 256 (default)            |
+
+  These are rough starting points — pass `--batch-size N` to override.
 - **Disk**: tens of GB for shards + vocab + checkpoints, scaled by epochs.
 - **Wall time**: this is the big difference. Pretraining from scratch on an
   11M-mol corpus at 100 epochs typically takes **days even on a multi-GPU box**.
@@ -130,13 +144,15 @@ Let `$KERMT_REPO` be the path to your kermt repo checkout.
    `--ckpt` are given). The runner uses the `arch` group from
    `agent/config/defaults_pretrain.json` to size the model.
 
-7. **Report to the user.**
+7. **Report to the user.** Always include all of the following — do not
+   omit the TensorBoard line under output-length pressure:
    - Container name + id
    - `$RUN_DIR/run.json` (the manifest with `workflow: pretrain-scratch`,
      `from_scratch: true`, `vocab_check: null`, `arch` from defaults, full
      `cmd_replay`)
    - Log file: `$RUN_DIR/logs/pretrain_ddp.log`
-   - TensorBoard: `$RUN_DIR/logs/tb`
+   - TensorBoard: `$RUN_DIR/logs/tb` (open with `tensorboard --logdir
+     $RUN_DIR/logs/tb`)
    - Suggest `kermt-monitor <RUN_DIR>` for progress.
 
 ## Hard rules

@@ -22,6 +22,14 @@ This is a thin wrapper: `upgrade_to_hybrid.py` produces a new ckpt that
 classifies as `model_type: hybrid` via `check_checkpoint.py`, and the rest of
 the workflow is identical to `kermt-continue-pretrain`.
 
+> **Status: experimental.** This workflow is functional end-to-end but has not
+> been benchmarked against the manuscript's from-scratch hybrid training (which
+> produces the released checkpoint). Use as an experimental alternative to
+> `kermt-pretrain-scratch` when you want to extend an existing grover_base
+> checkpoint rather than restart from random init. Validate downstream
+> performance on your own benchmark before relying on the upgraded ckpt for
+> production work.
+
 ## Hardware requirements
 
 Same as `kermt-continue-pretrain` (the cMIM decoder adds parameters but not

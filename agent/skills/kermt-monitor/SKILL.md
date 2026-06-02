@@ -105,13 +105,30 @@ Let `RUN_DIR=$1` (or whatever path the user supplies).
      Wall-clock: 1h 23m since started_at; ETA ~6h remaining.
      ```
 
-6. **If `--follow`, stream live logs.**
+6. **Final test-metrics block (finetune, on completion).** If `workflow` is
+   `finetune` AND the container has exited cleanly (`State.Status=exited`,
+   `ExitCode=0`) AND `$RUN_DIR/ckpt/fold_*/test_result.csv` exists, parse it
+   and emit a per-task metric table:
+   ```
+   Final test metrics (per task):
+     Target              MAE
+     HLM_clearance       0.187
+     RLM_clearance       0.213
+     MDR1-MDCK_efflux    0.241
+     solubility_pH6.8    0.156
+   ```
+   The metric column matches `args_applied.metric` (mae for regression, auc
+   for classification, etc.). For multi-fold or ensemble runs, average across
+   folds/models and note `± std` if std > 0. Skip silently if no
+   `test_result.csv` exists (run incomplete or no test split was emitted).
+
+7. **If `--follow`, stream live logs.**
    ```
    docker logs -f $container_name
    ```
    Wraps until ^C.
 
-7. **Stop / cleanup hints** (printed at end of one-shot mode):
+8. **Stop / cleanup hints** (printed at end of one-shot mode):
    ```
    To stop:        docker stop $container_name
    To remove:     docker rm $container_name

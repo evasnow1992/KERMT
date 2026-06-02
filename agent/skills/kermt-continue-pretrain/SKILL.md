@@ -24,9 +24,22 @@ prepares the corpus, launches the runner, and returns a run directory.
   `torch.cuda.device_count()`; `--gpus 0,2` overrides. On a single GPU the
   runner falls back to `--batch_size 32 --save_interval 500`; on multi-GPU
   it uses the `defaults_pretrain.json` values (currently `batch_size 256`).
-- **VRAM**: ≥ 16 GB per GPU for the default `depth 6 / hidden 800 / batch
-  256` configuration. Lower VRAM works at smaller batch sizes — pass
-  `--batch-size N` to override.
+  Note: `--gpus N` uses **torch.cuda** indexing, which can differ from
+  `nvidia-smi`'s display order on multi-GPU hosts (PCI bus vs. CUDA
+  enumeration). To target a specific physical GPU, set `CUDA_VISIBLE_DEVICES`
+  before invoking, or run
+  `python -c "import torch; print([torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])"`
+  to confirm which device you're picking.
+- **VRAM**: the default `--batch-size 256` is sized for A100-class hardware
+  (80 GB VRAM). On smaller GPUs, downscale to avoid OOM:
+
+  | GPU class                | VRAM       | Suggested `--batch-size` |
+  |--------------------------|------------|--------------------------|
+  | L4, T4, V100 16 GB       | 16–24 GB   | 32–64                    |
+  | A100 40 GB, L40, A40     | 40–48 GB   | 128                      |
+  | A100 80 GB, H100, H200   | 80 GB      | 256 (default)            |
+
+  These are rough starting points — pass `--batch-size N` to override.
 - **Disk**: tens of GB depending on corpus size + epochs (each checkpoint
   is several hundred MB).
 - **Driver / CUDA**: any host supporting CUDA 12.6 (the kermt image base).
