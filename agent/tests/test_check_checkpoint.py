@@ -269,7 +269,7 @@ def test_finetune_init_accepts_pretrain_ckpt(tmp_path: Path) -> None:
 def test_finetune_init_rejects_finetuned_ckpt(tmp_path: Path) -> None:
     """An already-finetuned ckpt (task FFN heads present) is rejected by
     finetune_init: finetune-on-finetune via the agent skill isn't supported
-    in v1 because saved-task identity can't be machine-verified against the
+    because saved-task identity can't be machine-verified against the
     new training data. The error message points at the manual escape hatch."""
     sd = {**_encoder_keys(), **_finetune_ffn_keys()}
     ckpt = _write_ckpt(tmp_path, sd, args=_make_args())

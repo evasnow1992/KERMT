@@ -244,9 +244,9 @@ def test_dispatch_deferred_index_predetermined(tmp_path: Path) -> None:
 
 def test_rejects_finetuned_ckpt(tmp_path: Path) -> None:
     """The kermt-finetune skill rejects already-finetuned ckpts. Finetune-on-
-    finetune isn't supported in v1: saved-task identity can't be machine-
-    verified against the new training data (dim match doesn't prove target
-    or dataset identity). Manual escape hatch: call `main.py finetune` directly."""
+    finetune isn't supported: saved-task identity can't be machine-verified
+    against the new training data (dim match doesn't prove target or dataset
+    identity). Manual escape hatch: call `main.py finetune` directly."""
     ckpt, prep, val = _setup(tmp_path, has_task_ffn=True)
     code, m = _run(
         "--ckpt", str(ckpt), "--prepare-manifest", str(prep),

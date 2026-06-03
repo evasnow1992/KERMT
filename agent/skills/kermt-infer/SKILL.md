@@ -19,7 +19,7 @@ launch the runner blocking, return the predictions CSV.
 
 ## Hardware requirements
 
-- **GPUs**: 1 (single-GPU). Multi-GPU inference is not in v1 scope.
+- **GPUs**: 1 (single-GPU). Multi-GPU inference is not currently supported.
 - **VRAM**: ≥ 4 GB for the default `batch_size 32`.
 - **Disk**: a few hundred MB per run (cleaned CSV + features + predictions).
 - **Driver / CUDA**: any host supporting CUDA 12.6 (the kermt image base).
@@ -107,7 +107,7 @@ Let `$KERMT_REPO` be the path to your kermt repo checkout, and assume
 - **Arch comes from the ckpt, never from CLI/defaults.** The runner records
   the validator's arch block in `run.json` but does not pass arch flags into
   `main.py predict` — predict reads them from the loaded ckpt's saved_args.
-- **Single-GPU only.** Multi-GPU inference is out of v1 scope.
+- **Single-GPU only.** Multi-GPU inference is not currently supported.
 - **Echo applied defaults.** The `args_applied` field of `run.json` records
   every flag's value + source (user / default-config). Surface a short
   summary of any default-filled flag.

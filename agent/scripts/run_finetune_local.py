@@ -20,8 +20,8 @@ User-supplied arch flags are not exposed; the runner refuses to override what
 the ckpt dictates so the FFN heads attach to a consistent encoder.
 
 Single-GPU is the default for finetune (per agent/README's hardware table —
-multi-GPU finetune is not in v1's scope and main.py's finetune path doesn't
-DDP). `--gpus N` picks a specific device id; defaults to GPU 0.
+multi-GPU finetune is not currently supported and main.py's finetune path
+doesn't DDP). `--gpus N` picks a specific device id; defaults to GPU 0.
 
 CLI
 ---
@@ -309,7 +309,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     arch = _arch_from_validator(validator_out)
     model_type = validator_out.get("model_type")
 
-    # 3. GPU selection (single-GPU only in v1).
+    # 3. GPU selection (single-GPU only).
     gpu = resolve_single_gpu(args.gpus, workflow="finetune")
 
     # 4. Apply defaults + collect args_applied.
@@ -389,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ckpt-validator-out", default=None,
                    help="Optional cached check_checkpoint.py JSON; computed if absent.")
     p.add_argument("--gpus", default=None,
-                   help="Single GPU id (default 0). v1 finetune is single-GPU only; "
+                   help="Single GPU id (default 0). Finetune is single-GPU only; "
                         "passing '0,1' is rejected with a clear error.")
     p.add_argument("--dry-run", action="store_true",
                    help="Write run.json + print the command without executing.")

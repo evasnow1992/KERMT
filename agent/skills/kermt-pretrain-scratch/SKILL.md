@@ -163,7 +163,7 @@ Let `$KERMT_REPO` be the path to your kermt repo checkout.
   architectural choice (vocab = lightweight, hybrid = SOTA). Prompt the user
   if not given on the CLI.
 - **Strong warning before launching.** From-scratch pretrain is the most
-  expensive workflow in v1. The user needs to know what they're committing to.
+  expensive workflow. The user needs to know what they're committing to.
 
 ## Common errors
 

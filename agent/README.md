@@ -5,6 +5,25 @@ KERMT workflows locally. The skills are tool-agnostic Markdown files; the
 scripts are deterministic kernels that can also be invoked directly without an
 agent.
 
+## Audience: who should read what
+
+This README serves both human users and the agents that drive the skills.
+
+- **If you are a user:** you do not need to read this file end-to-end to use
+  the skills. Skip to [Installing the skills](#installing-the-skills), install
+  once, then ask your agent (Claude Code, Codex, Nemotron, etc.) to run a
+  workflow by name — for example, *"use kermt-finetune to fine-tune this
+  checkpoint on this CSV."* The agent will read the relevant `SKILL.md` files
+  and drive the rest. Skim the [Skills](#skills) table below if you want a
+  one-line summary of each workflow, but the deeper sections are reference
+  material for the agent, not required reading for you.
+- **If you are an agent:** the sections below — Skills, Released models,
+  Convention: runs/..., Running a workflow — describe the orchestration
+  patterns and conventions you need to invoke the skills correctly. Read the
+  relevant `skills/<skill-name>/SKILL.md` for the specific workflow the user
+  asked for, plus the bind-mount and `KERMT_REPO` notes in
+  [Running a workflow](#running-a-workflow).
+
 ## Container-first
 
 Every workflow runs inside the `kermt:latest` docker image, built locally from
@@ -18,28 +37,36 @@ Linux only; Mac and Windows are not currently tested and may need adjustments
 (especially around GPU passthrough — Docker Desktop on Mac does not support
 `--gpus all`).
 
-## Skills in v1
+## Skills
+
+The seven KERMT skills split into two categories.
+
+**Workflow skills** — the ones users invoke by name. Each composes a
+check_checkpoint → check_data → prepare_data → run_\<workflow\> pipeline.
 
 | Skill | Workflow | User provides |
 |---|---|---|
-| `kermt-setup` | Build/verify the `kermt:latest` docker image. Every other skill depends on this. | — |
 | `kermt-continue-pretrain` | Continue pretraining from an existing KERMT checkpoint. Verifies the ckpt's vocab head sizes match the supplied vocab files; refuses to proceed on mismatch. | Checkpoint + its bundled vocab files (see [Released models](#released-models)), pretrain CSV, hyperparameters (optional) |
 | `kermt-pretrain-scratch` | Pretrain a fresh KERMT model from scratch on a user corpus. Builds a new vocab from the corpus and initializes the model architecture from `config/defaults_pretrain.json`. Days-scale; warns the user before launching. | Pretrain CSV, `--pretrain-target-mode {vocab\|cmim\|hybrid}` (required), hyperparameters (optional) |
 | `kermt-add-cmim-pretrain` | Take a Grover-base-style checkpoint (no cMIM decoder), add a randomly-initialized decoder, then continue pretraining as Hybrid (vocab + contrast). | Encoder-only checkpoint, pretrain CSV, hyperparameters |
 | `kermt-finetune` | Finetune a pretrained checkpoint on a labeled task. | Pretrained checkpoint, labeled CSV, target column names |
 | `kermt-infer` | Run predictions with a finetuned checkpoint. | Finetuned checkpoint, CSV with SMILES |
 | `kermt-embed` | Extract molecular embeddings from any encoder-bearing checkpoint. | Checkpoint, CSV with SMILES |
-| `kermt-monitor` | Tail logs and report progress for a detached pretrain (or any long-running) run. | A `runs/<workflow>_<timestamp>/` directory from a prior detached launch |
+
+**Companion skills** — auto-invoked by the workflow skills above; not
+intended for direct user invocation, though they can be invoked standalone
+when needed (e.g. forcing an image rebuild, debugging a detached run).
+
+| Skill | Workflow | User provides |
+|---|---|---|
+| `kermt-setup` | Build/verify the `kermt:latest` docker image. The first workflow skill you run triggers this automatically; only invoke directly to force a rebuild or debug the image. | — |
+| `kermt-monitor` | Tail logs and report progress for a detached pretrain (or any long-running) run. Suggested at the end of each detached-launch skill's output; you can also invoke it directly if you want a one-shot status check. | A `runs/<workflow>_<timestamp>/` directory from a prior detached launch |
 
 Pretraining is long-running (hours to days). The `kermt-continue-pretrain` and
 `kermt-add-cmim-pretrain` skills launch detached and return a run directory
-plus a TensorBoard URL; use `kermt-monitor` to check progress.
+plus a TensorBoard URL; the agent typically invokes `kermt-monitor` next.
 
-`kermt-setup` and `kermt-monitor` are **atomic skills** (wrap a single
-component), while the five workflow skills (continue-pretrain /
-add-cmim-pretrain / finetune / infer / embed) are **workflow skills** that
-compose a check_checkpoint → check_data → prepare_data → run_<workflow>
-pipeline. All seven are markdown + scripts, a passive instruction set —
+All seven skills are markdown + scripts, a passive instruction set —
 they call deterministic Python kernels but make no autonomous decisions
 and expose no network APIs.
 
@@ -64,11 +91,8 @@ built on `nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04`. The host driver must
 support CUDA 12.6 or newer. `kermt-setup` checks this; if it fails, the skill
 surfaces the gap and stops.
 
-**Local-only in v1.** All workflows assume a local CUDA-capable host (the
-"Run locally" path). Remote-backend provisioning (auto-spinning up a GPU on
-a cloud provider, building the image there, and routing execution to it) is
-on the v2 roadmap. Users on machines without a GPU should wait for v2 or
-manually arrange a GPU host.
+**Local execution.** All workflows assume a local CUDA-capable host. Users on
+machines without a GPU need to arrange a GPU host before invoking the skills.
 
 ## Released models
 

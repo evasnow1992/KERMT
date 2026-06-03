@@ -19,9 +19,9 @@ launch the runner detached, return a run directory + container name.
 
 ## Hardware requirements
 
-- **GPUs**: 1 (single-GPU). v1 finetune does not DDP; if you have multiple
+- **GPUs**: 1 (single-GPU). Finetune does not DDP; if you have multiple
   GPUs visible, pass `--gpus 0` (or whichever id) to select one. Multi-GPU
-  finetune is not in scope for v1.
+  finetune is not currently supported.
 - **VRAM**: ≥ 8 GB for the default `batch_size 32` configuration. Lower VRAM
   works at smaller batch sizes — pass `--batch-size N` to override.
 - **Disk**: a few GB per run (checkpoint + features + logs).
@@ -238,14 +238,14 @@ helper bind-mounts them at known container paths.
   predictions with the existing finetuned model. To resume a finetune on
   the SAME dataset, bypass the skill and call
   `python main.py finetune --checkpoint_path <ckpt> ...` directly — the
-  agent skill doesn't support resume in v1 because saved-task identity
+  agent skill doesn't support resume because saved-task identity
   can't be machine-verified against the new training data.
 - `prepare_data manifest reports ok=False` → check `errors` for the failed
   step (typically clean_smiles or save_features). Fix and re-run.
 - `ffn_num_task_specific_layers=N>0 but ffn_task_specific_hidden_size is unset`
   → MTL heads need an explicit hidden size. Pass `--ffn-task-specific-hidden-size H`.
-- `v1 finetune is single-GPU` → multi-GPU finetune is out of v1 scope; pick
-  a single id.
+- `finetune is single-GPU` → multi-GPU finetune is not currently supported;
+  pick a single id.
 
 ## Replayability
 

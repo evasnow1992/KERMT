@@ -25,7 +25,7 @@ finetune_init       Starting a finetune from a pretrained ckpt. Requires
                     encoder. Pretrain heads (vocab / contrast) are tolerated
                     but unused. Already-finetuned ckpts (task FFN heads
                     present) are REJECTED — finetune-on-finetune via the
-                    agent skill isn't supported in v1 because saved-task
+                    agent skill isn't supported because saved-task
                     identity can't be machine-verified against the new
                     training data.
 
@@ -328,8 +328,8 @@ def _apply_mode_contract(mode: str, classification: dict[str, Any]) -> list[str]
         if has_ffn:
             errors.append(
                 "continue_pretrain expects a pretrain ckpt; this ckpt has task FFN heads "
-                "(it has been finetuned). Use a pretrain checkpoint, or finetune+continue is "
-                "not a supported workflow in v1."
+                "(it has been finetuned). Use a pretrain checkpoint — finetune+continue is "
+                "not a supported workflow."
             )
     elif mode == "upgrade_to_hybrid":
         if has_contrast:
@@ -344,7 +344,7 @@ def _apply_mode_contract(mode: str, classification: dict[str, Any]) -> list[str]
         # Requires an encoder. Pretrain heads (vocab / contrast) are unused
         # at finetune time but harmless. Task FFN heads (i.e. an already-
         # finetuned ckpt) are NOT accepted — finetune-on-finetune isn't
-        # supported by the kermt-finetune skill in v1 because the saved-task
+        # supported by the kermt-finetune skill because the saved-task
         # identity can't be machine-verified against the new training data
         # (dimension match doesn't prove target identity, dataset identity,
         # or absence of train/test contamination).
@@ -354,7 +354,7 @@ def _apply_mode_contract(mode: str, classification: dict[str, Any]) -> list[str]
                 f"this ckpt is classified as '{mt}' with task FFN heads attached. "
                 f"To resume a finetune on the SAME dataset, call "
                 f"`python main.py finetune --checkpoint_path <ckpt> ...` directly — the "
-                f"kermt-finetune skill doesn't support resume in v1."
+                f"kermt-finetune skill doesn't support resume."
             )
     elif mode == "inference":
         if not has_ffn:

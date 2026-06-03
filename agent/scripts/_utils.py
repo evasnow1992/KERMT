@@ -161,7 +161,7 @@ def format_cmd_replay(argv: list[str], *, env: dict[str, str] | None = None) -> 
 
 
 def resolve_single_gpu(override: str | None, *, workflow: str) -> int:
-    """Returns a single GPU id (int). v1 finetune/inference/embed are
+    """Returns a single GPU id (int). The finetune/inference/embed workflows are
     single-GPU only; `--gpus '0,1'` or multi-id CUDA_VISIBLE_DEVICES is rejected
     with a workflow-specific error. (The pretrain runner has its own multi-GPU
     `_detect_gpus` helper — see run_pretrain_local.py.)"""
@@ -172,14 +172,14 @@ def resolve_single_gpu(override: str | None, *, workflow: str) -> int:
             if len(ids) > 1:
                 raise ValueError(
                     f"CUDA_VISIBLE_DEVICES='{env_visible}' selects multiple GPUs but "
-                    f"v1 {workflow} is single-GPU only. Restrict to one id."
+                    f"the {workflow} workflow is single-GPU only. Restrict to one id."
                 )
             return int(ids[0])
         return 0
     parts = [p.strip() for p in override.split(",") if p.strip()]
     if len(parts) != 1:
         raise ValueError(
-            f"--gpus '{override}' selects {len(parts)} GPUs; v1 {workflow} is single-GPU only."
+            f"--gpus '{override}' selects {len(parts)} GPUs; the {workflow} workflow is single-GPU only."
         )
     return int(parts[0])
 
