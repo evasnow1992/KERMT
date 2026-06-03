@@ -233,6 +233,15 @@ def _reduce_to_smiles_column(
     floats every column after SMILES, which crashes on non-numeric passthrough
     columns (e.g. a 'split' label of 'train'/'val'/'test', or a 'Molecule Name'
     string). Inference does not need target columns, so drop them here.
+
+    Note on skip semantics: this step is idempotent — running it on an
+    already-single-column file is a no-op. We record that with
+    `skipped_due_to_idempotent: True`, NOT `skipped_due_to_existing: True`.
+    The two fields have different meanings: `_existing` means "I found a
+    cached output file from a prior run and reused it" (overridden by
+    `--force`); `_idempotent` means "the input is already in the desired
+    state, so re-executing changes nothing" (safe to skip even under
+    `--force`).
     """
     step_name = f"reduce_to_smiles_only({csv_path.name})"
     start = time.time()
@@ -243,7 +252,7 @@ def _reduce_to_smiles_column(
             "output": str(csv_path),
             "ok": True,
             "duration_s": time.time() - start,
-            "skipped_due_to_existing": True,
+            "skipped_due_to_idempotent": True,
             "note": "already single-column",
         })
         return csv_path
