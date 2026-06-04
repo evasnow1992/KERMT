@@ -148,12 +148,19 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler) -> Tuple[int, 
     # TODO(sveccham): Change this to weights_only=True
     ckpt = torch.load(checkpoint_path, weights_only=False)
     model.module.load_state_dict(ckpt["state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    scheduler.current_step = ckpt["scheduler_step"]
 
-    epoch = ckpt["epoch"]
-    scheduler_step = ckpt["scheduler_step"]
-    batch_idx = ckpt["batch_idx"]
+    if "optimizer" in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except (ValueError, KeyError) as e:
+            print(f"Could not load optimizer state ({e}); starting with fresh optimizer state.", flush=True)
+    else:
+        print("Checkpoint has no optimizer state (slim release ckpt); starting with fresh optimizer state.", flush=True)
+
+    scheduler_step = ckpt.get("scheduler_step", 0)
+    scheduler.current_step = scheduler_step
+    epoch = ckpt.get("epoch", 0)
+    batch_idx = ckpt.get("batch_idx", 0)
     wandb_run_id = ckpt.get("wandb_run_id", None)
 
     print(f"Batch index from loaded checkpoint: {batch_idx}", flush=True)
