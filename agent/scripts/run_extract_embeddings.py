@@ -93,6 +93,14 @@ def _build_argv(
     argv += ["--input_file", manifest["outputs"]["clean_csv"]]
     argv += ["--output_path", str(outputs_dir)]
     argv += ["--device", "cuda"]
+    # clean_smiles.py preserves the input CSV's column layout, so the cleaned
+    # CSV has SMILES at whichever column the input had. Forward the
+    # auto-detected smiles_column from prepare_data.json so extract_embeddings
+    # doesn't fall back to its default of column 0 (which would index a
+    # non-SMILES column for inputs like openadmet/all.csv where SMILES is at
+    # column 1). Default to 0 if the manifest is from an older prepare_data
+    # version that didn't record the field.
+    argv += ["--smiles_column", str(manifest.get("smiles_column", 0))]
     if "batch_size" in applied:
         argv += ["--batch_size", str(applied["batch_size"]["value"])]
 
