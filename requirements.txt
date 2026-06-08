@@ -1,0 +1,25 @@
+# Supplementary pip-format dependency manifest, mirroring environment.yml.
+#
+# The CANONICAL dependency source is environment.yml, which is the file
+# Dockerfile (`conda env create -f environment.yml`) and the README's
+# documented host-install instruction both use. This requirements.txt is
+# maintained in parallel ONLY so security/SCA scanners that don't parse
+# conda env files (NVIDIA nSpect, BlackDuck, etc.) can enumerate the
+# project's open-source dependencies.
+#
+# *** Keep both files in sync when adding, removing, or version-bumping
+# *** dependencies. Conda channel-specific names are mapped to their pip
+# *** equivalents below (pytorch-gpu → torch).
+#
+# Source: environment.yml @ tree d51521651bf1f92658a1cc35eaccbe3e076083f8
+torch==2.7.1
+rdkit==2025.09.1
+cuik_molmaker>=0.2
+descriptastorus>2.2.0
+optuna
+scikit-learn
+tensorboard
+wandb
+setuptools>=80.0.0,<82.0.0
+protobuf>=5.29.5
+pytest
