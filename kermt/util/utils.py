@@ -39,10 +39,11 @@ The general utility functions.
 """
 import csv
 import logging
-import math
 import os
+import json
 import pickle
 import random
+import math
 from argparse import Namespace
 from collections import defaultdict
 from logging import Logger
@@ -65,7 +66,7 @@ from kermt.util.scheduler import NoamLR
 def get_model_args():
     """
     Get model structure related parameters.
-
+    
     Note: 'attn_out' is intentionally excluded. It controls the self-attention readout
     output size (FFN input = hidden_size * attn_out) and is only used during finetuning.
     Old checkpoints may have attn_out=128 saved, which causes model size to blow up.
@@ -73,6 +74,7 @@ def get_model_args():
 
     :return: a list containing parameters
     """
+    # Changes: removed 'fine_tune_coff' from the list.
     return ['model_type', 'ensemble_size', 'input_layer', 'hidden_size', 'bias', 'depth',
             'dropout', 'activation', 'undirected', 'ffn_hidden_size', 'ffn_num_layers',
             'atom_message', 'weight_decay', 'select_by_loss', 'skip_epoch', 'backbone',
@@ -81,6 +83,7 @@ def get_model_args():
             'dist_coff', 'no_attach_fea', 'coord', "num_attn_head", "num_mt_block",
             'num_tasks',  # Required for prediction on blinded data (no target columns)
             ]
+
 
 def get_finetune_predict_consistency_args():
     """
@@ -329,8 +332,16 @@ def split_data(data: MoleculeDataset,
         for split in range(3):
             split_indices = []
             for index in index_set[split]:
-                with open(os.path.join(args.crossval_index_dir, f'{index}.pkl'), 'rb') as rf:
-                    split_indices.extend(pickle.load(rf))
+                # Default is JSON; fall back to .pkl only if the JSON variant
+                # is not present (preserves old on-disk index directories).
+                json_path = os.path.join(args.crossval_index_dir, f'{index}.json')
+                pkl_path = os.path.join(args.crossval_index_dir, f'{index}.pkl')
+                if os.path.exists(json_path):
+                    with open(json_path, 'r') as rf:
+                        split_indices.extend(json.load(rf))
+                else:
+                    with open(pkl_path, 'rb') as rf:
+                        split_indices.extend(pickle.load(rf))
             data_split.append([data[i] for i in split_indices])
         train, val, test = tuple(data_split)
         return MoleculeDataset(train), MoleculeDataset(val), MoleculeDataset(test)
@@ -350,12 +361,18 @@ def split_data(data: MoleculeDataset,
         assert folds_file is not None
         assert test_fold_index is not None
 
-        try:
-            with open(folds_file, 'rb') as f:
-                all_fold_indices = pickle.load(f)
-        except UnicodeDecodeError:
-            with open(folds_file, 'rb') as f:
-                all_fold_indices = pickle.load(f, encoding='latin1')  # in case we're loading indices from python2
+        # Default is JSON. Explicit ``.pkl`` / ``.pckl`` opts into pickle (with a
+        # python2 latin1 fallback for legacy binaries that may still be on disk).
+        if folds_file.endswith(('.pkl', '.pckl')):
+            try:
+                with open(folds_file, 'rb') as f:
+                    all_fold_indices = pickle.load(f)
+            except UnicodeDecodeError:
+                with open(folds_file, 'rb') as f:
+                    all_fold_indices = pickle.load(f, encoding='latin1')  # in case we're loading indices from python2
+        else:
+            with open(folds_file, 'r') as f:
+                all_fold_indices = json.load(f)
         # assert len(data) == sum([len(fold_indices) for fold_indices in all_fold_indices])
 
         log_scaffold_stats(data, all_fold_indices, logger=logger)
@@ -605,9 +622,16 @@ def load_args(path: str) -> Namespace:
 
 def get_ffn_layer_names(model: KermtFinetuneTask):
     """
-    Get the ffn layer id for KermtFinetune Task. (Adhoc!)
-    :param model:
-    :return:
+    Get parameter tensor ids for task-specific layers in KermtFinetuneTask.
+    
+    Task-specific layers are those added for finetuning (not from pretrained checkpoint):
+    - FFN layers: mol_atom_from_atom_ffn, mol_atom_from_bond_ffn
+    - Readout attention layers: readout.attn (when using self_attention)
+    
+    These should be trained with full learning rate during finetuning.
+    
+    :param model: The KermtFinetuneTask model
+    :return: List of parameter tensor memory ids for task-specific layers
     """
     # Readout and atom/bond ffn layers are returned
     return [name for name, _ in model.named_parameters() if "kermt" not in name]
@@ -657,7 +681,11 @@ def build_lr_scheduler(optimizer, args: Namespace, total_epochs: List[int] = Non
     """
 
     # Learning rate scheduler
-    # Divide the parameter into two groups for the finetune.
+    # When fine_tune_coff == 0, encoder is frozen and not in optimizer,
+    # so we only have task params (1 group) with full LR (fine_tune_coff=1.0)
+    # When fine_tune_coff > 0, we have 2 groups: encoder (index 0) and task (index 1)
+    scheduler_fine_tune_coff = 1.0 if args.fine_tune_coff == 0 else args.fine_tune_coff
+    
     return NoamLR(
         optimizer=optimizer,
         warmup_epochs=args.warmup_epochs,
@@ -666,7 +694,7 @@ def build_lr_scheduler(optimizer, args: Namespace, total_epochs: List[int] = Non
         init_lr=args.init_lr,
         max_lr=args.max_lr,
         final_lr=args.final_lr,
-        fine_tune_coff=args.fine_tune_coff
+        fine_tune_coff=scheduler_fine_tune_coff
     )
 
 
@@ -711,16 +739,19 @@ def load_checkpoint(path: str,
                     current_args: Namespace = None,
                     cuda: bool = None,
                     logger: logging.Logger = None,
-                    strict_shape_check: bool = True):
+                    strict_shape_check: bool = False):
     """
-    Loads a model checkpoint.
+    Loads a model checkpoint. This function can change the values of current_args according to args present in the checkpoint.
 
     :param path: Path where checkpoint is saved.
     :param current_args: The current arguments. Replaces the arguments loaded from the checkpoint if provided.
     :param cuda: Whether to move model to cuda.
     :param logger: A logger.
-    :param strict_shape_check: Whether to check if the shape of the loaded model parameters matches the shape of the model parameters.
-    :return: The loaded MPNN and loaded checkpoint state.
+    :param strict_shape_check: If True, raise ValueError when a loaded parameter's shape
+        does not match the current model. If False (default, required for CMIM-style
+        workflows where pretrain checkpoints may have extra/partial params), log and
+        skip the mismatched parameter.
+    :return: The loaded MPNN and loaded checkpoint state
     """
     debug = logger.debug if logger is not None else print
 
@@ -729,7 +760,17 @@ def load_checkpoint(path: str,
     state = torch.load(path, map_location=lambda storage, loc: storage, weights_only=False)
     args, loaded_state_dict = state['args'], state['state_dict']
 
+    # Transform parameter names for compatibility
+    # 1. Replace old "grover" naming with "kermt"
     loaded_state_dict = OrderedDict([(k.replace("grover", "kermt"), v) for k, v in loaded_state_dict.items()])
+
+    # 2. Handle CMIM checkpoint format: strip "latent_dist." prefix
+    #    This transforms "latent_dist.kermt.*" -> "kermt.*" for finetuning compatibility
+    has_cmim_params = any("latent_dist." in k for k in loaded_state_dict.keys())
+    if has_cmim_params:
+        debug("Detected CMIM checkpoint format. Transforming 'latent_dist.kermt.*' -> 'kermt.*' for finetuning compatibility.")
+    loaded_state_dict = OrderedDict([(k.replace("latent_dist.", ""), v) for k, v in loaded_state_dict.items()])
+
     model_ralated_args = get_model_args()
 
     if current_args is not None:
@@ -753,11 +794,13 @@ def load_checkpoint(path: str,
             debug(f'Pretrained parameter "{param_name}" cannot be found in model parameters.')
         elif model_state_dict[new_param_name].shape != loaded_state_dict[param_name].shape:
             if strict_shape_check:
-                raise ValueError(f'Pretrained parameter "{param_name}" of shape {loaded_state_dict[param_name].shape} does not match corresponding model parameter of shape {model_state_dict[new_param_name].shape}.')
-            else:
-                debug(f'Pretrained parameter "{param_name}" '
-                    f'of shape {loaded_state_dict[param_name].shape} does not match corresponding '
-                    f'model parameter of shape {model_state_dict[new_param_name].shape}.')
+                raise ValueError(
+                    f'Pretrained parameter "{param_name}" of shape {loaded_state_dict[param_name].shape} '
+                    f'does not match corresponding model parameter of shape {model_state_dict[new_param_name].shape}.'
+                )
+            debug(f'Pretrained parameter "{param_name}" '
+                  f'of shape {loaded_state_dict[param_name].shape} does not match corresponding '
+                  f'model parameter of shape {model_state_dict[new_param_name].shape}.')
         else:
             debug(f'Loading pretrained parameter "{param_name}".')
             pretrained_state_dict[new_param_name] = loaded_state_dict[param_name]
@@ -773,14 +816,21 @@ def load_checkpoint(path: str,
 
 
 def load_checkpoint_for_prediction(path: str,
-                    current_args: Namespace,
-                    cuda: bool = None,
-                    logger: logging.Logger = None):
+                                   current_args: Namespace,
+                                   cuda: bool = None,
+                                   logger: logging.Logger = None):
     """
-    Loads a model checkpoint.
+    Loads a finetuned model checkpoint for prediction.
+
+    Unlike :func:`load_checkpoint` (which is permissive because CMIM-style
+    pretrain checkpoints may have extra/partial params), this function enforces
+    strict consistency: every loaded parameter must be present in the current
+    model with the same shape, and arguments such as ``features_generator`` /
+    ``rdkit2D_normalization_type`` must match those baked into the checkpoint.
 
     :param path: Path where checkpoint is saved.
-    :param current_args: The current arguments. Replaces the arguments loaded from the checkpoint if provided.
+    :param current_args: The current arguments. Replaces the model-related arguments
+        loaded from the checkpoint.
     :param cuda: Whether to move model to cuda.
     :param logger: A logger.
     :return: The loaded MPNN.
@@ -819,14 +869,15 @@ def load_checkpoint_for_prediction(path: str,
     for param_name in loaded_state_dict.keys():
         new_param_name = param_name
         if new_param_name not in model_state_dict:
-            raise ValueError(f'Pretrained parameter "{param_name}" cannot be found in model parameters.')
-        elif model_state_dict[new_param_name].shape != loaded_state_dict[param_name].shape:
-            # Shape checking should always be strict
-            raise ValueError(f'Pretrained parameter "{param_name}" of shape {loaded_state_dict[param_name].shape} does not match corresponding model parameter of shape {model_state_dict[new_param_name].shape}.')
-        else:
-            debug(f'Loading pretrained parameter "{param_name}".')
-            finetuned_state_dict[new_param_name] = loaded_state_dict[param_name]
-    # Load pretrained weights
+            raise ValueError(f'Finetuned parameter "{param_name}" cannot be found in model parameters.')
+        if model_state_dict[new_param_name].shape != loaded_state_dict[param_name].shape:
+            raise ValueError(
+                f'Finetuned parameter "{param_name}" of shape {loaded_state_dict[param_name].shape} '
+                f'does not match corresponding model parameter of shape {model_state_dict[new_param_name].shape}.'
+            )
+        debug(f'Loading finetuned parameter "{param_name}".')
+        finetuned_state_dict[new_param_name] = loaded_state_dict[param_name]
+
     model_state_dict.update(finetuned_state_dict)
     model.load_state_dict(model_state_dict)
 
@@ -914,7 +965,7 @@ def save_model_for_restart(path:str, model, optimizer, scheduler, scaler, featur
     state = {
         'args': args,
         'epoch': epoch,
-        'state_dict': model.state_dict(),
+        'state_dict': model.state_dict(), # model state_dict
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
         'data_scaler': {

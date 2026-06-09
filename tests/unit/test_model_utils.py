@@ -43,7 +43,13 @@ from kermt.util.nn_utils import param_count_trainable, param_count_total
 
 
 def _minimal_finetune_args(**overrides):
-    """Builds a minimal Namespace for constructing a KermtFinetuneTask."""
+    """Builds a minimal Namespace for constructing a KermtFinetuneTask.
+
+    Includes task-specific-FFN defaults (disabled) so the Namespace covers
+    every attribute models.py reads. The shape
+    (ffn_num_task_specific_layers=0, ffn_task_specific_hidden_size=None)
+    keeps the task-specific feature off and behaves like the baseline fixture.
+    """
     defaults = dict(
         parser_name='finetune', hidden_size=64, depth=2,
         num_attn_head=2, num_mt_block=1, bias=False, dense=False,
@@ -55,6 +61,8 @@ def _minimal_finetune_args(**overrides):
         dataset_type='regression', dist_coff=0.1, bond_drop_rate=0.0,
         num_tasks=1, fine_tune_coff=1.0,
         init_lr=1e-4, weight_decay=0.0,
+        # Task-specific FFN layers; disabled in this fixture.
+        ffn_num_task_specific_layers=0, ffn_task_specific_hidden_size=None,
     )
     defaults.update(overrides)
     return Namespace(**defaults)

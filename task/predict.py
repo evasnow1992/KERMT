@@ -50,7 +50,7 @@ from kermt.data import MolCollator
 from kermt.data import MoleculeDataset
 from kermt.data import StandardScaler
 from kermt.util.utils import get_data, get_data_from_smiles, create_logger, load_args, get_task_names, tqdm, \
-    load_checkpoint_for_prediction, load_scalars
+    load_checkpoint, load_scalars
 
 
 def predict(model: nn.Module,
@@ -78,9 +78,12 @@ def predict(model: nn.Module,
     preds = []
 
     # num_iters, iter_step = len(data), batch_size
-    loss_sum, iter_count = 0, 0
+    num_tasks = args.num_tasks
+    loss_sum = np.zeros(num_tasks, dtype=np.float32)
+    iter_count = 0
 
     mol_collator = MolCollator(args=args, shared_dict=shared_dict)
+    # mol_dataset = MoleculeDataset(data)
 
     num_workers = 0
     mol_loader = DataLoader(data, batch_size=batch_size, shuffle=False, num_workers=num_workers,
@@ -101,8 +104,9 @@ def predict(model: nn.Module,
 
             if loss_func is not None:
                 loss = loss_func(batch_preds, targets) * class_weights * mask
-                loss = loss.sum() / mask.sum()
-                loss_sum += loss.item()
+                loss_batch = loss.sum(axis=0) / torch.clamp(mask.sum(axis=0), min=1.0)
+                loss_batch = loss_batch.cpu().numpy()
+                loss_sum += loss_batch
         # Collect vectors
         batch_preds = batch_preds.data.cpu().numpy().tolist()
         if scaler is not None:
@@ -190,7 +194,7 @@ def make_predictions(args: Namespace, newest_train_args=None, smiles: List[str] 
     count = 0
     for checkpoint_path in tqdm(args.checkpoint_paths, total=len(args.checkpoint_paths)):
         # Load model
-        model = load_checkpoint_for_prediction(checkpoint_path, cuda=args.cuda, current_args=args, logger=logger)
+        model, _ = load_checkpoint(checkpoint_path, cuda=args.cuda, current_args=args, logger=logger)
         model_preds, _ = predict(
             model=model,
             data=test_data,

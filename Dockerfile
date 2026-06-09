@@ -42,9 +42,12 @@ RUN rm -rf /var/lib/apt/lists/*
 RUN rm -rf /softwares/miniconda3/pkgs/xz-5.6.4-h5eee18b_1/
 # RUN apt clean && apt autoremove -y
 
-# COPY code and cleanup
-COPY . /code
-RUN rm -rf /code/.git /code/.code-workspace
+# Note: the repo is NOT copied into the image. Agent skills and any equivalent
+# host workflow bind-mount the live kermt repo checkout at /workspace (see
+# agent/scripts/kermt_container.sh). Keeping the image as a pure environment
+# makes rebuilds cache-friendly (only invalidates when environment.yml changes,
+# not on every code edit) and avoids stale-code footguns where a baked-in /code
+# and the runtime bind-mount disagree.
 
 # Equivalent to `conda activate kermt`
 SHELL ["conda", "run", "--no-capture-output", "-n", "kermt", "/bin/bash", "-c"]

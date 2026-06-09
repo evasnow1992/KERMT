@@ -37,6 +37,7 @@
 """
 The parsing functions for the argument input.
 """
+import json
 import os
 import pickle
 from argparse import ArgumentParser, Namespace
@@ -58,6 +59,11 @@ def add_common_args(parser: ArgumentParser):
                         help='Turn off cuda')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size')
+    parser.add_argument('--wandb_project', type=str,
+                        help='Wandb project name. If this is provided, WandB will be used to log the training process.')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                        help='Wandb run name')
+
 
 
 def add_predict_args(parser: ArgumentParser):
@@ -82,13 +88,11 @@ def add_predict_args(parser: ArgumentParser):
                         help='Method of generating additional features')
     parser.add_argument('--features_path', type=str, nargs='*',
                         help='Path to features to use in FNN (instead of features_generator)')
+    parser.add_argument('--use_cuikmolmaker_featurization', action='store_true', default=False,
+                        help='Use cuik-molmaker package for featurization of atoms and bonds in molecules')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for prediction')
     parser.add_argument('--no_features_scaling', action='store_true', default=False,
                         help='Turn off scaling of features')
-    parser.add_argument('--rdkit2D_normalization_type', type=str, choices=("fast", "best", "descriptastorus"), default='fast',
-                        help='Type of normalization for rdkit2D features. Choices: fast, best, descriptastorus')
-    parser.add_argument('--use_cuikmolmaker_featurization', action='store_true', default=False,
-                        help='Use cuik-molmaker package for featurization of atoms and bonds in molecules')
 
 
 def add_fingerprint_args(parser):
@@ -205,11 +209,12 @@ def add_finetune_args(parser: ArgumentParser):
                              'Note: Does NOT affect loss function used during training'
                              '(loss is determined by the `dataset_type` argument).'
                              'Note: Defaults to "auc" for classification and "rmse" for regression.')
+    parser.add_argument('--use_mtl_loss', action='store_true', default=False,
+                        help='Use MTL loss function')
     parser.add_argument('--show_individual_scores', action='store_true', default=False,
                         help='Show all scores for individual targets, not just average, at the end')
-
-
-
+    parser.add_argument('--task_wise_checkpoint', action='store_true', default=False,
+                        help='Checkpoint the model for each task separately')
 
     # Training arguments
     parser.add_argument('--epochs', type=int, default=30,
@@ -237,6 +242,7 @@ def add_finetune_args(parser: ArgumentParser):
     parser.add_argument('--activation', type=str, default='ReLU',
                         choices=['ReLU', 'LeakyReLU', 'PReLU', 'tanh', 'SELU', 'ELU'],
                         help='Activation function')
+    
     # Encoder architecture arguments (required when training from scratch without checkpoint)
     parser.add_argument('--hidden_size', type=int, default=800,
                         help='Encoder hidden dimension. Default: 800 (matches pretrained models)')
@@ -250,11 +256,17 @@ def add_finetune_args(parser: ArgumentParser):
                         help='Whether to add bias to encoder linear layers. Default: False')
     parser.add_argument('--undirected', action='store_true', default=False,
                         help='Use undirected edges (sum the two relevant bond vectors). Default: False')
-
+    
     parser.add_argument('--ffn_hidden_size', type=int, default=None,
                         help='Hidden dim for higher-capacity FFN (defaults to hidden_size)')
     parser.add_argument('--ffn_num_layers', type=int, default=2,
                         help='Number of layers in FFN after MPN encoding')
+    parser.add_argument('--ffn_task_specific_hidden_size', type=int, default=None,
+                        help='Hidden size for task-specific FFN layers (and common FFN '
+                             'output when task-specific layers are used). Required if '
+                             'ffn_num_task_specific_layers > 0.')
+    parser.add_argument('--ffn_num_task_specific_layers', type=int, default=0,
+                        help='Number of task-specific layers in FFN after common FFN layer encoding')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='weight_decay')
     parser.add_argument('--select_by_loss', action='store_true', default=False,
                         help='Use validation loss as refence standard to select best model to predict')
@@ -278,7 +290,7 @@ def add_finetune_args(parser: ArgumentParser):
     parser.add_argument('--bond_drop_rate', type=float, default=0, help='Drop out bond in molecular.')
     parser.add_argument('--distinct_init', action='store_true', default=False,
                         help='Using distinct weight init for model ensemble')
-    parser.add_argument('--fine_tune_coff', type=float, default=1,
+    parser.add_argument('--fine_tune_coff', type=float, default=1.0,
                         help='Enable distinct fine tune learning rate for fc and other layer')
 
     # For multi-gpu finetune.
@@ -289,88 +301,204 @@ def add_finetune_args(parser: ArgumentParser):
     # Add hyperparameter optimization
     parser.add_argument("--n_trials", type=int, dest="n_trials",
                         help="Number of trials for hyperparameter optimization using Optuna")
+    parser.add_argument("--hpo_mode", type=str, default="all", choices=["all", "openadmet"],
+                        help="HPO mode: 'all' for full model tuning (default), "
+                             "'openadmet' for small dataset with frozen encoder and 1 FFN layer")
 
 
 def add_pretrain_args(parser: ArgumentParser):
+    """
+    Add arguments for pretraining with organized parameter groups.
+    Supports both vocabulary-based pretraining and CMIM pretraining with decoder.
+    """
+    
+    # ========== System and Hardware Arguments ==========
     parser.add_argument('--cuda', type=bool, default=True,
-                        help='Enable gpu traning or not.')
+                        help='Enable gpu training or not.')
     parser.add_argument('--enable_multi_gpu', dest='enable_multi_gpu',
                         action='store_true', default=False,
-                        help='enable multi-GPU training')
-
-    # Data arguments
+                        help='Enable multi-GPU training')
+    parser.add_argument("--seed", type=int, default=0, 
+                        help="Random seed for pretraining.")
+    
+    # ========== Data Arguments ==========
     parser.add_argument('--train_data_path', type=str, required=True,
                         help='Path to train data CSV file')
     parser.add_argument('--val_data_path', type=str, required=False,
                         help='Path to val data CSV file')
     parser.add_argument('--test_data_path', type=str, required=False, default=None,
                         help='Path to test data CSV file')
-    parser.add_argument('--fg_label_path', type=str, nargs='*',
-                        help='Path to the label of fg task.')
-    parser.add_argument('--atom_vocab_path', type=str, help="Path to the vocabulary.")
-    parser.add_argument('--bond_vocab_path', type=str,
-                        help="Path to the bond vocabulary.")
+    parser.add_argument('--lazy_loading', action='store_true', default=False,
+                        help='Skip pre-loading all data files. Use for very large datasets (e.g., full ZINC15). '
+                             'Data will be loaded on-demand during training with LRU cache eviction.')
+    parser.add_argument('--max_cached_files', type=int, default=100,
+                        help='Maximum number of data files to keep in memory (LRU cache). '
+                             'Used for lazy_loading mode and memory-mapped SMILES cache. '
+                             'For large datasets (e.g., ZINC15 200M with 417 files), set to 500+ '
+                             'to cache all SMILES and avoid CSV parsing during training. '
+                             'Default: 100 files.')
     
-    # Featurization arguments
+    # Vocabulary paths (mode-dependent)
+    parser.add_argument('--atom_vocab_path', type=str, required=False, default=None,
+                        help="Path to atom vocabulary (required for vocab-based pretraining).")
+    parser.add_argument('--bond_vocab_path', type=str, required=False, default=None,
+                        help="Path to bond vocabulary (required for vocab-based pretraining).")
+    parser.add_argument('--smiles_vocab_path', type=str, required=False, default=None,
+                        help="Path to SMILES vocabulary (required for CMIM/decoder training).")
+    
+    # Pre-tokenized data for memory-efficient CMIM training
+    parser.add_argument('--tokens_dir', type=str, required=False, default=None,
+                        help="Path to pre-tokenized .npy files for CMIM training. "
+                             "When provided, uses memory-mapped loading for efficient multi-worker training. "
+                             "Generated by pretokenize_zinc15.py or prepare_zinc15_unified.py script.")
+    parser.add_argument('--features_mmap_dir', type=str, required=False, default=None,
+                        help="Path to memory-mappable feature .npy files for hybrid/vocab training. "
+                             "When provided with --tokens_dir, enables multi-worker data loading for "
+                             "hybrid and vocab training modes. Generated by prepare_zinc15_unified.py "
+                             "(feature_mmap/ directory).")
+    parser.add_argument('--fg_label_path', type=str, nargs='*',
+                        help='Path to functional group task labels (optional).')
+    
+    # Featurization
     parser.add_argument('--use_cuikmolmaker_featurization', action='store_true', default=False,
-                        help='Use cuik-molmaker package for featurization of molecules')
-
-    # Model arguments
+                        help='Use cuik-molmaker package for molecule featurization')
+    
+    # ========== Training Mode Selection ==========
+    parser.add_argument('--pretrain_mode', type=str, default='vocab',
+                        choices=['vocab', 'cmim', 'hybrid'],
+                        help='Pretraining mode: '
+                             '"vocab" = original GROVER vocabulary prediction (av/bv/fg tasks), '
+                             '"cmim" = CMIM contrastive learning + SMILES reconstruction, '
+                             '"hybrid" = both CMIM and vocab objectives combined. '
+                             'Default: vocab')
+    parser.add_argument('--vocab_loss_weight', type=float, default=1.0,
+                        help='Weight for vocabulary prediction loss in hybrid training. '
+                             'Total loss = CMIM_loss + vocab_loss_weight * vocab_loss. Default: 1.0')
+    
+    # ========== Encoder Model Arguments ==========
+    parser.add_argument("--backbone", default="gtrans", choices=["gtrans", "dualtrans"],
+                        help="Encoder backbone architecture. `dualtrans` is the legacy "
+                             "name for the same architecture, kept for compatibility with "
+                             "older grover_base checkpoints.")
     parser.add_argument('--embedding_output_type', type=str, default='both', nargs='?',
                         choices=("atom", "bond", "both"),
-                        help="Type of output embeddings. Options: atom, bond, both")
-
-    #parser.add_argument('--source_branch', type=str, default='both', nargs='?', choices=("atom", "bond", "both"),
-    #                    help="Type of source branch in gtrans. Options: atom, bond, both")
-
-    parser.add_argument('--save_dir', type=str, default=None,
-                        help='Directory where model checkpoints will be saved')
-    parser.add_argument('--save_interval', type=int, default=100, help='The model saving interval (in steps).')
+                        help="Type of output embeddings from encoder. Options: atom, bond, both")
     parser.add_argument('--hidden_size', type=float, default=3,
-                        help='Dimensionality of hidden layers. The actual dimension is hidden_size * 100.')
-    parser.add_argument('--bias', action='store_true', default=False,
-                        help='Whether to add bias to linear layers')
+                        help='Encoder hidden dimension (actual dimension = hidden_size * 100). '
+                             'Default: 3 (→ 300).')
     parser.add_argument('--depth', type=int, default=3,
-                        help='Number of message passing steps')
+                        help='Number of encoder message passing layers.')
+    parser.add_argument('--num_attn_head', type=int, default=4, 
+                        help='Number of attention heads in encoder MTBlock.')
+    parser.add_argument('--num_mt_block', type=int, default=1, 
+                        help="Number of MTBlocks in encoder.")
     parser.add_argument('--dropout', type=float, default=0.0,
-                        help='Dropout probability')
+                        help='Dropout probability for encoder.')
     parser.add_argument('--activation', type=str, default='PReLU',
                         choices=['ReLU', 'LeakyReLU', 'PReLU', 'tanh', 'SELU', 'ELU'],
-                        help='Activation function')
+                        help='Activation function for encoder.')
+    parser.add_argument('--bias', action='store_true', default=False,
+                        help='Whether to add bias to encoder linear layers')
     parser.add_argument('--undirected', action='store_true', default=False,
-                        help='Undirected edges (always sum the two relevant bond vectors)')
-    parser.add_argument('--weight_decay', type=float, default=0.0, help='weight_decay')
-    parser.add_argument('--num_attn_head', type=int, default=4, help='The attention head in MTBlock.')
-    parser.add_argument('--num_mt_block', type=int, default=1, help="The number of MTBlock.")
-    parser.add_argument('--dist_coff', type=float, default=0.1, help='The disagreement coefficient for '
-                                                                     'the atom and bond branch.')
-
-
-    # Training arguments
-    parser.add_argument("--backbone", default="gtrans", choices=["gtrans"])
+                        help='Use undirected edges (sum the two relevant bond vectors)')
+    parser.add_argument('--bond_drop_rate', type=float, default=0, 
+                        help='Dropout rate for bonds in molecular graph')
+    parser.add_argument('--dist_coff', type=float, default=0.1, 
+                        help='Disagreement coefficient for atom and bond branches.')
+    
+    # Readout layer (for molecule-level embedding)
+    parser.add_argument('--self_attention', action='store_true', default=False,
+                        help='Use self-attention readout layer. '
+                             'Default: False (uses mean aggregation).')
+    parser.add_argument('--attn_hidden', type=int, default=4,
+                        help='Self-attention readout hidden layer size.')
+    parser.add_argument('--attn_out', type=int, default=8,
+                        help='Self-attention readout output feature size (FFN input = hidden_size * attn_out).')
+    
+    # ========== CMIM-Specific Arguments ==========
+    parser.add_argument('--latent_dim', type=int, default=512,
+                        help='Dimension of latent space for CMIM. This also determines decoder hidden size '
+                             '(latent_dim must equal decoder hidden_size for cross-attention). '
+                             'Default: 512.')
+    parser.add_argument('--contrastive_temperature', type=float, default=0.1,
+                        help='Temperature parameter for contrastive loss in CMIM. '
+                             'Default: 0.1')
+    parser.add_argument('--reconstruction_loss_weight', type=float, default=1.0,
+                        help='Weight for SMILES reconstruction loss in CMIM training. '
+                             'Default: 1.0')
+    parser.add_argument('--normalize_gradient', action='store_true', default=False,
+                        help='Normalize gradients of CMIM loss components (log_q_z_given_x, log_P_z) by latent dimensionality. '
+                             'Useful when latent_dim is large and dominates gradient magnitudes. '
+                             'Default: False')
+    parser.add_argument('--normalize_loss', action='store_true', default=False,
+                        help='Normalize CMIM loss values by latent dimensionality. '
+                             'Scales the loss values themselves (affects what gets logged). '
+                             'Can be used independently or together with --normalize_gradient. '
+                             'Default: False')
+    
+    # ========== Decoder Model Arguments (for CMIM with reconstruction) ==========
+    parser.add_argument('--decoder_num_layers', type=int, default=3,
+                        help='Number of transformer decoder layers. Default: 3')
+    parser.add_argument('--decoder_num_attention_heads', type=int, default=8,
+                        help='Number of attention heads in decoder. Default: 8')
+    parser.add_argument('--decoder_ffn_hidden_size', type=int, default=2048,
+                        help='Decoder feedforward hidden size. '
+                             'Default: 2048 (4 * latent_dim with latent_dim=512).')
+    parser.add_argument('--decoder_dropout', type=float, default=0.1,
+                        help='Dropout probability for decoder. Default: 0.1')
+    parser.add_argument('--decoder_max_seq_len', type=int, default=512,
+                        help='Maximum SMILES sequence length for decoder (sequences will be truncated). '
+                             'Default: 512. Increase if you have longer SMILES.')
+    parser.add_argument('--decoder_positional_encoding', type=str, default='rope',
+                        choices=['rope', 'sinusoidal'],
+                        help='Type of positional encoding for decoder. '
+                             'Options: "rope" (Rotary Position Embedding) or "sinusoidal" (classic additive). '
+                             'Default: rope')
+    parser.add_argument('--decoder_gate_self_attn', action='store_true', default=False,
+                        help='Enable G1 gating for decoder self-attention layers. '
+                             'Applies multiplicative sigmoid gating after SDPA output. '
+                             'Only works with positional_encoding="rope". Default: False')
+    parser.add_argument('--decoder_gate_cross_attn', action='store_true', default=False,
+                        help='Enable G1 gating for decoder cross-attention layers. '
+                             'Applies multiplicative sigmoid gating after SDPA output. '
+                             'Only works with positional_encoding="rope". Default: False')
+    
+    # ========== Training Arguments ==========
     parser.add_argument('--epochs', type=int, default=30,
-                        help='Number of epochs to run')
+                        help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size per GPU (micro batch size)')
-    parser.add_argument('--max_val_batches', type=int, default=10,
-                        help='Maximum number of batches to in validation loop.')
     parser.add_argument('--num_dataloader_workers', type=int, default=0,
                         help='Number of workers for dataloader')
     parser.add_argument('--warmup_epochs', type=float, default=2.0,
-                        help='Number of epochs during which learning rate increases linearly from'
-                             'init_lr to max_lr. Afterwards, learning rate decreases exponentially'
-                             'from max_lr to final_lr.')
+                        help='Number of warmup epochs for learning rate schedule')
     parser.add_argument('--init_lr', type=float, default=1e-4,
                         help='Initial learning rate')
     parser.add_argument('--max_lr', type=float, default=1e-3,
                         help='Maximum learning rate')
     parser.add_argument('--final_lr', type=float, default=1e-4,
                         help='Final learning rate')
-    parser.add_argument('--bond_drop_rate', type=float, default=0, help='Drop out bond in molecular')
-
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for pretraining.")
-
-    parser.add_argument("--tensorboard", action="store_true", default=False, help="Use tensorboard to visualize training.")
+    parser.add_argument('--weight_decay', type=float, default=0.0, 
+                        help='Weight decay for optimizer')
+    parser.add_argument('--max_val_batches', type=int, default=10,
+                        help='Maximum number of batches in validation loop.')
+    parser.add_argument('--val_interval', type=int, default=0,
+                        help='Run validation every N steps (0 = only at end of each epoch). '
+                             'Similar to save_interval; e.g. 500 to validate every 500 steps.')
+    
+    # ========== Checkpoint and Logging Arguments ==========
+    parser.add_argument('--save_dir', type=str, default=None,
+                        help='Directory where model checkpoints will be saved')
+    parser.add_argument('--save_interval', type=int, default=100, 
+                        help='Model saving interval (in steps).')
+    parser.add_argument("--tensorboard", action="store_true", default=False,
+                        help="Use tensorboard to visualize training.")
+    parser.add_argument('--train_interval', type=int, default=10,
+                        help='Log train metrics to TensorBoard every N steps (default: 10).')
+    parser.add_argument('--wandb_project', type=str, default=None,
+                        help='Wandb project name. If provided, WandB will be used to log pretraining metrics.')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                        help='Wandb run name')
 
 def update_checkpoint_args(args: Namespace):
     """
@@ -511,8 +639,14 @@ def modify_train_args(args: Namespace):
     assert (args.split_type == 'crossval') == (args.crossval_index_dir is not None)
     assert (args.split_type in ['crossval', 'index_predetermined']) == (args.crossval_index_file is not None)
     if args.split_type in ['crossval', 'index_predetermined']:
-        with open(args.crossval_index_file, 'rb') as rf:
-            args.crossval_index_sets = pickle.load(rf)
+        # Default is JSON (secure). Explicit ``.pkl`` / ``.pckl`` opts into pickle
+        # so older on-disk crossval index files can still be loaded if encountered.
+        if args.crossval_index_file.endswith(('.pkl', '.pckl')):
+            with open(args.crossval_index_file, 'rb') as rf:
+                args.crossval_index_sets = pickle.load(rf)
+        else:
+            with open(args.crossval_index_file, 'r') as rf:
+                args.crossval_index_sets = json.load(rf)
         args.num_folds = len(args.crossval_index_sets)
         args.seed = 0
 
@@ -521,6 +655,9 @@ def modify_train_args(args: Namespace):
         args.no_cache = True
 
     setattr(args, 'fingerprint', False)
+    
+    # Set dense=False for encoder (required when training from scratch)
+    args.dense = False
 
     # Set dense=False for encoder (required when training from scratch)
     args.dense = False

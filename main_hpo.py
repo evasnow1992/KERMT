@@ -57,7 +57,10 @@ def setup(seed):
     torch.use_deterministic_algorithms(mode=True)
 
 def objective_all(trial, args, logger):
-
+    """
+    HPO objective for general finetuning with full model (attention, multi-layer FFN).
+    Suitable for larger datasets with unfrozen encoder.
+    """
     ## Setup optuna stuff
     # Change save_dir to temp location
     print(f"Current trial.number: {trial.number}")
@@ -115,6 +118,99 @@ def objective_all(trial, args, logger):
     return min_val_loss
 
 
+def objective_openadmet(trial, args, logger):
+    """
+    HPO objective for OpenADMET Challenge (~5K samples).
+    Uses frozen encoder, 1 FFN layer, and simpler hyperparameter space.
+    Optimized for small dataset with limited trainable parameters.
+    """
+    ## Setup optuna stuff
+    print(f"Current trial.number: {trial.number}")
+    failed_trial_number = RetryFailedTrialCallback.retried_trial_number(trial)
+    print(f"failed_trial_number: {failed_trial_number}")
+
+    trial_number = trial.number
+    parent_save_dir = args.save_dir
+    args.save_dir = os.path.join(args.save_dir, f"tmp_trial_{trial_number}")
+    print(f"Saving temporarily to {args.save_dir}")
+
+    ## HPO parameters for OpenADMET (small dataset, frozen encoder)
+    
+    # Learning rate - wider range since only training FFN
+    # Base config: init_lr=1e-4, max_lr=1e-3, final_lr=1e-5
+    max_lr = trial.suggest_float("max_lr", 5E-4, 2E-3, step=5E-4)
+    final_lr_factor = trial.suggest_categorical("final_lr_factor", choices=[10, 50, 100])
+    final_lr = max_lr / final_lr_factor
+    init_lr = max_lr / INIT_LR_FACTOR
+
+    args.max_lr = max_lr 
+    args.init_lr = init_lr
+    args.final_lr = final_lr
+
+    # Dropout - important for small dataset to prevent overfitting
+    dropout = trial.suggest_categorical("dropout", choices=[0.0, 0.1, 0.2, 0.3])
+    args.dropout = dropout
+
+    # Readout type: mean (no attention) vs self_attention
+    # With small data, mean readout is often better (fewer params)
+    use_attention = trial.suggest_categorical("use_attention", choices=[False, True])
+    args.self_attention = use_attention
+    attn_out = None  # Initialize for non-attention case
+    if use_attention:
+        # If using attention, tune attention output size
+        # FFN input dimension = hidden_size (800) * attn_out, so keep attn_out small
+        attn_out = trial.suggest_categorical("attn_out", choices=[4, 8])
+        args.attn_out = attn_out
+    
+    # Fine-tune coefficient: 0 = frozen encoder, try small values for partial unfreezing
+    fine_tune_coff = trial.suggest_categorical("fine_tune_coff", choices=[0.0, 0.01, 0.1])
+    args.fine_tune_coff = fine_tune_coff
+
+    # Batch size - smaller can help with small datasets
+    batch_size = trial.suggest_categorical("batch_size", choices=[32, 64, 128])
+    args.batch_size = batch_size
+
+    # Fixed for OpenADMET: single FFN layer (data too small for deeper)
+    args.ffn_num_layers = 1
+    args.ffn_hidden_size = None  # Not used with 1 layer
+
+    print("Current set of hyperparameters used:")
+    print(f"  max_lr: {max_lr}, init_lr: {init_lr}, final_lr: {final_lr}")
+    print(f"  dropout: {dropout}")
+    print(f"  use_attention: {use_attention}" + (f", attn_out: {attn_out}" if use_attention else ""))
+    print(f"  fine_tune_coff: {fine_tune_coff}")
+    print(f"  batch_size: {batch_size}")
+    
+    ensemble_scores, min_val_loss = run_training(args, logger, return_val=True)
+    print(f"*************** min_val_loss for trial {trial_number}: {min_val_loss} ***************")
+    
+    # Save trial parameters
+    trial_dict = {
+        "trial_number": trial_number,
+        "max_lr": max_lr,
+        "init_lr": init_lr,
+        "final_lr": final_lr,
+        "dropout": dropout,
+        "use_attention": use_attention,
+        "attn_out": attn_out,  # None when use_attention=False
+        "fine_tune_coff": fine_tune_coff,
+        "batch_size": batch_size,
+        "min_val_loss": min_val_loss,
+        "test_metric": float(np.nanmean(ensemble_scores)),
+    }
+    with open(f"{args.save_dir}/params.json", "w") as outfile: 
+        json.dump(trial_dict, outfile, indent=2)
+
+    # Move ckpt to actual path
+    final_save_dir = os.path.join(parent_save_dir, f"trial_{trial_number}")
+    print(f"Moving {args.save_dir} to {final_save_dir}")
+    shutil.move(args.save_dir, final_save_dir)
+
+    args.save_dir = parent_save_dir
+
+    return min_val_loss
+
+
 if __name__ == "__main__":
 
     args = parse_args()
@@ -149,8 +245,19 @@ if __name__ == "__main__":
 
     logger = create_logger(name='train', save_dir=args.save_dir, quiet=False)
     
+    # Choose HPO objective based on --hpo_mode argument
+    # Default to 'all' for backward compatibility
+    hpo_mode = getattr(args, 'hpo_mode', 'all')
+    print(f"HPO mode: {hpo_mode}")
     print(f"Number of trials for HPO: {args.n_trials}")
-    objective = partial(objective_all, args=args, logger=logger)
+    
+    if hpo_mode == 'openadmet':
+        print("Using OpenADMET HPO objective (frozen encoder, 1 FFN layer, small dataset)")
+        objective = partial(objective_openadmet, args=args, logger=logger)
+    else:
+        print("Using general HPO objective (full model tuning)")
+        objective = partial(objective_all, args=args, logger=logger)
+    
     study.optimize(objective, n_trials=args.n_trials, timeout=None,
                     callbacks=[MaxTrialsCallback(args.n_trials, states=(TrialState.COMPLETE,))])
 
@@ -164,8 +271,11 @@ if __name__ == "__main__":
     print("Best trial:")
     best_trial = study.best_trial
 
-    print("  Value: ", best_trial.value)
+    print(f"  Trial number: {best_trial.number}")
+    print(f"  Value (min_val_loss): {best_trial.value}")
 
     print("  Params: ")
     for key, value in best_trial.params.items():
-        print("    {}: {}".format(key, value))
+        print(f"    {key}: {value}")
+    
+    print(f"\nBest model saved at: {args.save_dir}/trial_{best_trial.number}/fold_0/model_0/model.pt")
