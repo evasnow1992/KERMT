@@ -139,6 +139,12 @@ Examples:
         default=0,
         help="Column index containing SMILES (default: 0)",
     )
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Overwrite an existing --output without the interactive prompt "
+        "(for scripted / non-interactive re-runs; matches save_features.py --restart).",
+    )
 
     args = parser.parse_args()
 
@@ -147,7 +153,7 @@ Examples:
         print(f"❌ Error: Input file not found: {args.input}")
         sys.exit(1)
 
-    if os.path.exists(args.output):
+    if os.path.exists(args.output) and not args.restart:
         response = input(
             f"⚠️  Output file already exists: {args.output}\n   Overwrite? (y/n): "
         )
