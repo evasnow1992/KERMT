@@ -103,9 +103,9 @@ def objective_all(trial, args, logger):
     ensemble_scores, min_val_loss = run_training(args, logger, return_val=True)
     print(f"*************** min_val_loss for trial {trial_number}: {min_val_loss} ***************")
     trial_dict = vars(args)
-    trial_dict["min_val_loss"] = min_val_loss
-    trial_dict["test_metric"] = np.nanmean(ensemble_scores)
-    with open(f"{args.save_dir}/params.json", "w") as outfile: 
+    trial_dict["min_val_loss"] = float(min_val_loss)
+    trial_dict["test_metric"] = float(np.nanmean(ensemble_scores))
+    with open(f"{args.save_dir}/params.json", "w") as outfile:
         json.dump(trial_dict, outfile)
 
     # Move ckpt to actual path
