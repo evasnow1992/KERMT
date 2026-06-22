@@ -176,8 +176,14 @@ Other agentskills.io-compatible agents should also work; see the
 
 ### Claude Code
 
-Claude Code expects skills at `~/.claude/skills/<skill-name>/SKILL.md`. From
-a clone of the kermt repo:
+Claude Code discovers skills at `~/.claude/skills/<skill-name>/SKILL.md`
+(personal scope, available from any directory) or
+`<repo>/.claude/skills/<skill-name>/SKILL.md` (project scope, this checkout
+only). `agent/skills/` is itself not a discovery path, so install the eight
+`kermt-*` skills once into one of those locations. `agent/skills/` stays the
+tool-agnostic source of truth (Codex / Nemotron read it directly).
+
+Personal scope (recommended — symlink into your personal skills dir):
 
 ```bash
 for d in agent/skills/kermt-*/; do
@@ -186,11 +192,21 @@ for d in agent/skills/kermt-*/; do
 done
 ```
 
+Project scope (scoped to this checkout) — run from the repo root instead:
+
+```bash
+mkdir -p .claude/skills
+for d in agent/skills/kermt-*/; do
+  name=$(basename "$d")
+  ln -sfn "../../agent/skills/$name" .claude/skills/"$name"
+done
+```
+
 Restart Claude Code once after the first install so it picks up the new
-`~/.claude/skills/` entries. The symlinked form means future `git pull` updates
-to the skill content take effect without re-installing. If you ever rename a
-skill on disk (e.g. `kermt-foo` → `kermt-bar`), clean the stale entry first:
-`rm -rf ~/.claude/skills/kermt-foo` before re-running the snippet above.
+entries. The symlinked form means future `git pull` updates to the skill
+content take effect without re-installing. If you ever rename a skill on disk
+(e.g. `kermt-foo` → `kermt-bar`), clean the stale entry first
+(`rm -rf ~/.claude/skills/kermt-foo`) before re-running the snippet.
 
 ### Codex
 
