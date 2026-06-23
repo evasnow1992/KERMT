@@ -143,6 +143,7 @@ exampledata/finetune/*.npz
 
 # Local-only datasets and trained models (not intended for upstream)
 model/
+models/
 tests/data/Biogen_for_grover/
 tests/data/ChEMBL_MT/
 tests/data/ZINC15_ChEMBL/
