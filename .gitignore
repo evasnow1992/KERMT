@@ -9,6 +9,9 @@ __pycache__/
 # VSCode
 *.code-workspace
 
+# Local Claude Code notes (personal dev notes, not for the public repo)
+CLAUDE.local.md
+
 # Distribution / packaging
 .Python
 build/

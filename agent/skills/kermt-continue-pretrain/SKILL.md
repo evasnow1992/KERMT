@@ -66,6 +66,10 @@ Optional:
 - `--vocab-loss-weight F` (hybrid only) / `--latent-dim N` /
   `--contrastive-temperature F` (cmim and hybrid only) — loss / decoder
   overrides.
+- `--wandb-project NAME` / `--wandb-run-name NAME` — optional Weights & Biases
+  logging. When `--wandb-project` is set, rank 0 logs train/val losses; the run
+  name is honored only alongside a project. Off by default. (Independent of the
+  ckpt's `wandb_run_id` continuity handling under `--resume`.)
 - `--resume` — see "Modes" section below.
 - `--gpus 0,2` — restrict to a GPU subset. Default uses all visible GPUs.
 - `--from-prepare <dir>` — skip the prepare step and reuse an existing
