@@ -51,10 +51,23 @@ conda env create -n kermt -f environment.yml
 conda activate kermt
 ```
 
-## Pretained Model Download
-The pretrained models models can be downloaded from the following links. 
+## Pretrained Model Download
+
+### KERMT v2.0 (recommended)
+
+The released KERMT v2.0 model is hosted on Hugging Face: [**nvidia/NV-KERMT-70M-v2**](https://huggingface.co/nvidia/NV-KERMT-70M-v2). The repository bundles the pretrained hybrid checkpoint (`kermt_contrastive_v2.0.pt`) together with its vocabulary files (`pretrain_atom_vocab.json`, `pretrain_bond_vocab.json`, `pretrain_smiles_vocab.pkl`), distributed under the NVIDIA Open Model License. The vocabulary files are an inseparable part of the model — keep them alongside the checkpoint.
+
+Download the full bundle into a local directory:
+```bash
+pip install huggingface_hub
+huggingface-cli download nvidia/NV-KERMT-70M-v2 --local-dir model/NV-KERMT-70M-v2
+```
+
+### GROVER base weights
+
+KERMT builds on the original GROVER encoder. The base GROVER weights can be downloaded from:
    - [GROVER<sub>base</sub>](https://1drv.ms/u/s!Ak4XFI0qaGjOhdlwa2_h-8WAymU1AQ)
-   - [GROVER<sub>large</sub>](https://1drv.ms/u/s!Ak4XFI0qaGjOhdlxC3mGn0LC1NFd6g) 
+   - [GROVER<sub>large</sub>](https://1drv.ms/u/s!Ak4XFI0qaGjOhdlxC3mGn0LC1NFd6g)
 
 
 ## Pretraining
