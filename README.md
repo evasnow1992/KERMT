@@ -55,7 +55,7 @@ conda activate kermt
 
 ### KERMT v2.0 (recommended)
 
-The released KERMT v2.0 model is hosted on Hugging Face: [**nvidia/NV-KERMT-70M-v2**](https://huggingface.co/nvidia/NV-KERMT-70M-v2). The repository bundles the pretrained hybrid checkpoint (`kermt_contrastive_v2.0.pt`) together with its vocabulary files (`pretrain_atom_vocab.json`, `pretrain_bond_vocab.json`, `pretrain_smiles_vocab.pkl`), distributed under the NVIDIA Open Model License. The vocabulary files are an inseparable part of the model — keep them alongside the checkpoint.
+The released KERMT v2.0 model is hosted on Hugging Face: [**nvidia/NV-KERMT-70M-v2**](https://huggingface.co/nvidia/NV-KERMT-70M-v2). Its contrastive pretraining is described in the Contrastive KERMT preprint ([arXiv:2606.11508](https://arxiv.org/abs/2606.11508)). The repository bundles the pretrained hybrid checkpoint (`kermt_contrastive_v2.0.pt`) together with its vocabulary files (`pretrain_atom_vocab.json`, `pretrain_bond_vocab.json`, `pretrain_smiles_vocab.pkl`), distributed under the NVIDIA Open Model License. The vocabulary files are an inseparable part of the model — keep them alongside the checkpoint.
 
 Download the full bundle into a local directory:
 ```bash
@@ -211,6 +211,7 @@ python main.py predict \
 - Paper:[Multitask finetuning and acceleration of chemical
 pretrained models for small molecule drug
 property prediction](https://arxiv.org/abs/2510.12719)
+- Contrastive KERMT (v2.0) preprint: [arXiv:2606.11508](https://arxiv.org/abs/2606.11508)
 - Dataset: [Figshare link](https://figshare.com/articles/dataset/Datasets_for_Multitask_finetuning_and_acceleration_of_chemical_pretrained_models_for_small_molecule_drug_property_prediction_/30350548/2)
 - [Original GROVER paper](https://arxiv.org/abs/2007.02835)
 - [Original GROVER implementation](https://github.com/tencent-ailab/grover)
