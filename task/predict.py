@@ -317,6 +317,10 @@ def evaluate_predictions(preds: List[List[float]],
                 continue
 
         if len(valid_targets[i]) == 0:
+            # Append nan (like the all-0/1 branch above) instead of skipping, so
+            # results stays aligned per-task; a bare `continue` would shift every
+            # later task's metric down one index.
+            results.append(float('nan'))
             continue
 
         results.append(metric_func(valid_targets[i], valid_preds[i]))
