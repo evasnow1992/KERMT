@@ -44,6 +44,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from rdkit import Chem
 from torch.utils.data import DataLoader
 
 from kermt.data import MolCollator
@@ -165,9 +166,18 @@ def make_predictions(args: Namespace, newest_train_args=None, smiles: List[str] 
     args.features_size = test_data.features_size()
 
     print('Validating SMILES')
-    valid_indices = [i for i in range(len(test_data))]
+    # Drop empty / unparseable / zero-heavy-atom SMILES before featurization —
+    # MolGraph raises on invalid input, so leaving them in aborts the whole run.
+    # valid_indices drives the None-insertion in write_prediction, so the written
+    # predictions realign to the original input rows. (Matches the criterion in
+    # utils.filter_invalid_smiles.)
+    valid_indices = []
+    for i in range(len(test_data)):
+        smi = test_data[i].smiles
+        mol = Chem.MolFromSmiles(smi) if smi else None
+        if mol is not None and mol.GetNumHeavyAtoms() > 0:
+            valid_indices.append(i)
     full_data = test_data
-    # test_data = MoleculeDataset([test_data[i] for i in valid_indices])
     test_data_list = []
     for i in valid_indices:
         test_data_list.append(test_data[i])
