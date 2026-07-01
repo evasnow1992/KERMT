@@ -116,6 +116,12 @@ def train(epoch, model, data, loss_func, mtl_loss, optimizer, scheduler,
 
         # Run model
         model.zero_grad()
+        if mtl_loss is not None:
+            # MTLLoss.log_sigma is a standalone parameter registered in the
+            # optimizer, not a submodule of `model`, so model.zero_grad() does
+            # not clear its grad. Without this its gradient accumulates across
+            # every batch and the learned task-uncertainty weights diverge.
+            mtl_loss.zero_grad()
         preds = model(batch, features_batch)
         loss = loss_func(preds, targets) * class_weights * mask
 
