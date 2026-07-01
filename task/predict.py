@@ -104,7 +104,17 @@ def predict(model: nn.Module,
                 continue
 
             if loss_func is not None:
-                loss = loss_func(batch_preds, targets) * class_weights * mask
+                if args.dataset_type == 'classification':
+                    # In eval the model already applies sigmoid to classification
+                    # outputs, so batch_preds are probabilities. loss_func is
+                    # BCEWithLogitsLoss, which would sigmoid a second time. Score
+                    # the eval loss with plain BCE on the probabilities (clamped
+                    # for numerical safety).
+                    probs = batch_preds.clamp(min=1e-7, max=1.0 - 1e-7)
+                    loss = torch.nn.functional.binary_cross_entropy(
+                        probs, targets, reduction='none') * class_weights * mask
+                else:
+                    loss = loss_func(batch_preds, targets) * class_weights * mask
                 loss_batch = loss.sum(axis=0) / torch.clamp(mask.sum(axis=0), min=1.0)
                 loss_batch = loss_batch.cpu().numpy()
                 loss_sum += loss_batch
