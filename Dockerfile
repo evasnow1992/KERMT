@@ -8,8 +8,15 @@ RUN apt-get update
 RUN apt-get install -y wget git build-essential zip unzip vim
 
 
-# install Miniforge (community conda-forge installer; no Anaconda ToS)
-RUN wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O miniforge.sh \
+# install Miniforge (community conda-forge installer; no Anaconda ToS).
+# Pinned to an immutable release and SHA-256 verified: identical source revisions
+# produce identical environments, and tampered installer bytes fail the build.
+# To bump: change MINIFORGE_VERSION, then set MINIFORGE_SHA256 from the release's
+# Miniforge3-<ver>-Linux-x86_64.sh.sha256 sidecar.
+ARG MINIFORGE_VERSION=26.3.2-3
+ARG MINIFORGE_SHA256=848194851a98903134187fbb4ab50efe87b003e0c0f808f97644b7524a62bf2c
+RUN wget -q "https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/Miniforge3-${MINIFORGE_VERSION}-Linux-x86_64.sh" -O miniforge.sh \
+    && echo "${MINIFORGE_SHA256}  miniforge.sh" | sha256sum --check --strict - \
     && /bin/bash miniforge.sh -b -p /softwares/miniforge3 \
     && rm -v miniforge.sh
 ENV PATH="/softwares/miniforge3/bin:${PATH}"

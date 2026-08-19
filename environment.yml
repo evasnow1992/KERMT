@@ -1,10 +1,7 @@
 name: kermt
 channels:
-  - rmg
   - conda-forge
   - nvidia
-  - rdkit
-  - pytorch
   - nodefaults
 dependencies:
   - python=3.11
