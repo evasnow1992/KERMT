@@ -33,7 +33,7 @@ docker build --rm -t kermt:latest -f Dockerfile .
 ```bash
 docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -v /path/to/data:/data -v /path/to/reference_pretrained_models:/reference_pretrained_models -it --name kermt  kermt:latest
 
-source /softwares/miniconda3/etc/profile.d/conda.sh && conda activate kermt
+source /softwares/miniforge3/etc/profile.d/conda.sh && conda activate kermt
 cd code
 ```
 

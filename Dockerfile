@@ -8,12 +8,12 @@ RUN apt-get update
 RUN apt-get install -y wget git build-essential zip unzip vim
 
 
-# install Miniconda (or Anaconda)
-RUN wget https://repo.anaconda.com/miniconda/Miniconda3-py311_25.5.1-0-Linux-x86_64.sh -O miniconda.sh \
-    && /bin/bash miniconda.sh -b -p /softwares/miniconda3 \
-    && rm -v miniconda.sh
-ENV PATH="/softwares/miniconda3/bin:${PATH}"
-ENV LD_LIBRARY_PATH="/softwares/miniconda3/lib:${LD_LIBRARY_PATH}"
+# install Miniforge (community conda-forge installer; no Anaconda ToS)
+RUN wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O miniforge.sh \
+    && /bin/bash miniforge.sh -b -p /softwares/miniforge3 \
+    && rm -v miniforge.sh
+ENV PATH="/softwares/miniforge3/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/softwares/miniforge3/lib:${LD_LIBRARY_PATH}"
 
 # install Python packages
 RUN pip install --upgrade pip
@@ -21,26 +21,13 @@ RUN pip install --upgrade pip
 # Override CUDA detection for conda
 ENV CONDA_OVERRIDE_CUDA=12.6
 
-# Accept channels Terms of Service
-RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
-
-# update conda
-# RUN conda config --set ssl_verify false
+# update conda (base is conda-forge under Miniforge — no defaults channel, no ToS to accept)
 RUN conda update -n base conda
-
-RUN conda config --add channels rmg
-RUN conda config --add channels conda-forge
-RUN conda config --add channels rdkit
-RUN conda config --add channels pytorch
-RUN conda update -n base xz
 RUN conda env create -n kermt -f /tmp/environment.yml
 
 # clean-up
 RUN rm -rf /var/lib/apt/lists/*
-# Clean up older xz package
-RUN rm -rf /softwares/miniconda3/pkgs/xz-5.6.4-h5eee18b_1/
-# RUN apt clean && apt autoremove -y
+RUN conda clean -afy
 
 # Note: the repo is NOT copied into the image. Agent skills and any equivalent
 # host workflow bind-mount the live kermt repo checkout at /workspace (see
