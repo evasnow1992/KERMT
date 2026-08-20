@@ -131,7 +131,7 @@ from kermt.data.kermtdataset import (
     KermtHybridPreTokenizedCollator,
     KermtVocabPreTokenizedCollator
 )
-from kermt.util.utils import create_logger
+from kermt.util.utils import create_logger, setup_determinism
 from kermt.util.ddp_utils import configure_nccl_for_topology, ddp_setup
 from kermt.model.models import KERMTEmbedding
 from task.kermttrainer import KERMTTrainer, KERMTCMIMTrainer, KERMTHybridTrainer
@@ -144,34 +144,6 @@ from kermt.util.nn_utils import param_count_trainable, param_count_total
 def pre_load_data_ddp(dataset: BatchMolDataset, dataset_size: int, samples_per_file: int):
     for i in range(1, dataset_size, samples_per_file):
         dataset.load_data(i)
-
-def setup_seed(seed: int):
-    """
-    Seed every RNG pretraining draws from, so a run is reproducible.
-
-    Mirrors ``setup()`` in main.py, which finetuning has always called. Seeding the
-    RNGs alone is not enough: it leaves cuBLAS/cuDNN free to pick nondeterministic
-    kernels, which on a 2-epoch fixture still moved the validation loss in the
-    fourth decimal. ``use_deterministic_algorithms`` is what closes that gap.
-
-    It is safe to enable here precisely because seeding is opt-in -- a run that
-    passes no ``--seed`` never reaches this function, so the path pretraining has
-    always taken is untouched. ``CUBLAS_WORKSPACE_CONFIG`` must be set before the
-    CUDA context is created, which is why it is handled in ``__main__`` rather than
-    here.
-
-    Every rank is seeded identically. DDP requires identical initial weights
-    anyway, and the ranks see different data because the sampler shards it.
-
-    :param seed: the seed to use.
-    """
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(mode=True)
-
 
 def seed_dataloader_worker(worker_id: int):
     """
@@ -202,9 +174,18 @@ def main(rank: int, world_size: int):
     args = parse_args_ddp()
 
     # Opt-in: unset (the default) leaves every RNG untouched, which is how
-    # pretraining has always run.
+    # pretraining has always run. setup_determinism() is the same helper the
+    # finetune and HPO entry points use, so all three stay in lockstep.
+    #
+    # Two things specific to pretraining's DDP path:
+    #  * Every rank is seeded identically. DDP requires identical initial weights
+    #    anyway, and the ranks see different data because the sampler shards it.
+    #  * setup_determinism() also sets CUBLAS_WORKSPACE_CONFIG, but that must
+    #    happen before the CUDA context exists -- far earlier than this, which is
+    #    why __main__ sets it before mp.spawn. The call here is a harmless no-op
+    #    (os.environ.setdefault) since the parent already set it.
     if args.seed is not None:
-        setup_seed(args.seed)
+        setup_determinism(args.seed)
 
     if rank == 0:
         print(f"{args=}")
@@ -729,7 +710,7 @@ def main(rank: int, world_size: int):
             print(f"Loaded checkpoint from epoch={epoch}, scheduler_step={scheduler_step}, prev_batch_idx={prev_batch_idx}")
             # Resume happens automatically whenever last_checkpoint.pt is present, so a
             # seeded run can silently stop being reproducible. Checkpoints carry no RNG
-            # state: setup_seed() has already rewound every RNG to its initial value while
+            # state: setup_determinism() has already rewound every RNG to its initial value while
             # the sampler skips ahead, and the dataloader workers draw from their own.
             if args.seed is not None and rank == 0:
                 print("[WARNING] Resuming from a checkpoint with --seed set. Checkpoints carry no "
@@ -805,7 +786,7 @@ if __name__ == "__main__":
     world_size = int(world_size)
     print(f"World size: {world_size}")
 
-    # setup_seed() enables deterministic algorithms, and cuBLAS requires this to be
+    # setup_determinism() enables deterministic algorithms, and cuBLAS requires this to be
     # set before the CUDA context exists -- so it has to happen here, in the parent,
     # before mp.spawn. Set unconditionally: it is inert unless deterministic
     # algorithms are actually switched on, and reading --seed this early would mean
