@@ -47,7 +47,7 @@ Mitigation: Outputs are written under an explicit output path supplied by the us
 ## Skill Output: <br>
 **Output Type(s):** [Analysis, Files] <br>
 **Output Format:** [CSV of per-molecule predictions; Markdown summary] <br>
-**Output Parameters:** [2D — one row per input molecule, one column per predicted task] <br>
+**Output Parameters:** [2D — one row per valid input molecule after cleaning and canonicalization, one column per predicted task] <br>
 **Other Properties Related to Output:** [Predictions are model estimates, not measurements, and are not calibrated probabilities of experimental outcome. Runs blocking, on a minutes-scale timeframe.] <br>
 
 ## Evaluation Agents Used: <br>

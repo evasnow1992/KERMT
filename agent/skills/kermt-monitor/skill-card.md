@@ -29,7 +29,7 @@ Global <br>
 
 ## Known Risks and Mitigations: <br>
 Risk: A stale or missing `run.json` can cause the skill to report on the wrong run, or to report nothing while a job is in fact still consuming GPU-hours. <br>
-Mitigation: The skill cross-checks `run.json` against live Docker container state rather than trusting the manifest alone. <br>
+Mitigation: The skill refuses to proceed when `run.json` is missing, and reports container identifiers so the user can verify the run directly. Because `run.json` does not record a container name, pass `--container <name-or-id>` when monitoring a specific run. <br>
 
 Risk: Log tailing surfaces run output into the agent transcript, which may include file paths or environment details. <br>
 Mitigation: The skill reads only the pretrain/finetune log; users should treat agent transcripts as sensitive and avoid pasting credentials into run configuration. <br>
